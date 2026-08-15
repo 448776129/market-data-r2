@@ -115,18 +115,24 @@ def fetch_symbol(region: str, symbol: str) -> dict[str, pd.DataFrame] | None:
 
 def _process_one(reg: str, symbol: str) -> tuple[str, dict | None]:
     """拉取并上传单只股票，返回 (symbol, data)。data 为 None 表示失败。"""
-    data = fetch_symbol(reg, symbol)
-    if data is None:
+    try:
+        data = fetch_symbol(reg, symbol)
+        if data is None:
+            return symbol, None
+        items: list[tuple[str, str, bool]] = []
+        for interval, df in data.items():
+            subdir = SUBDIR[interval]
+            index_col = DATE_COL if interval == "1d" else DT_COL
+            key = f"{reg}/{subdir}/{symbol}.csv"
+            items.append((key, df_to_csv(df, index_col), True))
+        if items:
+            res = r2store.upload_many(items)
+            if res.get("fail", 0) > 0:
+                return symbol, None
+        return symbol, data
+    except Exception as exc:  # noqa: BLE001 - 单只失败不中断整体
+        print(f"  [失败] {reg}:{symbol}: {exc}", flush=True)
         return symbol, None
-    items: list[tuple[str, str, bool]] = []
-    for interval, df in data.items():
-        subdir = SUBDIR[interval]
-        index_col = DATE_COL if interval == "1d" else DT_COL
-        key = f"{reg}/{subdir}/{symbol}.csv"
-        items.append((key, df_to_csv(df, index_col), True))
-    if items:
-        r2store.upload_many(items)
-    return symbol, data
 
 
 def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
@@ -175,9 +181,10 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
     )
 
     print(f"完成: 上传 {ok_files} 个对象, 失败 {len(fail_symbols)} 项")
+    # 单只股票失败不视为整体失败（避免 job 失败导致其余批次被取消），
+    # 仅打印警告；失败明细已写入 _status.json 供后续重试。
     if fail_symbols:
-        print(f"失败明细(前100): {fail_symbols}", file=sys.stderr)
-        return 1
+        print(f"警告: {len(fail_symbols)} 只股票失败(不中断): {fail_symbols[:30]}", flush=True)
     return 0
 
 
