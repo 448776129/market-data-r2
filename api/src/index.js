@@ -200,16 +200,24 @@ async function fetchUpstream(path, env) {
 }
 
 // 带区域回退的数据读取：
-// 中国 A股(.SS/.SZ) 与 中国 ETF(.SS/.SZ) 后缀相同，inferRegion 会识别为 cn。
-// 若在 cn 下找不到数据，回退尝试 cn_etf（中国 ETF 独立分类）。
+//  - 中国 A股(.SS/.SZ) 与 中国 ETF(.SS/.SZ) 后缀相同，inferRegion 识别为 cn。
+//    若 cn 下找不到，回退尝试 cn_etf（中国 ETF 独立分类）。
+//  - 美股裸代码（SPY/VOO/QQQ）inferRegion 识别为 us，但可能是 ETF，
+//    若 us 下找不到，回退尝试 etf（美股 ETF 独立分类）。
 // 返回文本；都找不到返回 null。
-async function fetchWithFallback(path, env, fallbackRegion = "cn_etf") {
+async function fetchWithFallback(path, env) {
   let text = await fetchUpstream(path, env);
   if (text !== null) return text;
-  // 回退：把 /cn/ 换成 /cn_etf/
-  const alt = path.replace("/cn/", `/${fallbackRegion}/`);
-  if (alt !== path) {
-    text = await fetchUpstream(alt, env);
+  // 回退1：/cn/ -> /cn_etf/
+  const altCn = path.replace("/cn/", "/cn_etf/");
+  if (altCn !== path) {
+    text = await fetchUpstream(altCn, env);
+    if (text !== null) return text;
+  }
+  // 回退2：/us/ -> /etf/
+  const altUs = path.replace("/us/", "/etf/");
+  if (altUs !== path) {
+    text = await fetchUpstream(altUs, env);
     if (text !== null) return text;
   }
   return null;

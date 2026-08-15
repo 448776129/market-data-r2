@@ -143,12 +143,13 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
     concurrency = int(os.environ.get("FETCH_CONCURRENCY", "6"))
 
     for reg in regions:
-        symbols = marketlib.load_symbols(reg)
-        symbols = marketlib.slice_batch(symbols, batch, batches)
+        # 完整清单（用于 put_universe；切 batch 只影响本批拉取范围）
+        all_symbols = marketlib.load_symbols(reg)
+        symbols = marketlib.slice_batch(all_symbols, batch, batches)
         if not symbols:
             print(f"[警告] {reg}: 无符号（universe 缺失？）", flush=True)
             continue
-        print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
+        print(f"[区域] {reg} ({len(symbols)}/{len(all_symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
 
         done = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -163,10 +164,10 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
                 if done % 25 == 0 or done == len(symbols):
                     print(f"  [{done}/{len(symbols)}] {reg} 已处理，失败 {len(fail_symbols)}", flush=True)
 
-        # 区域清单一并上传（供 Worker /universe 读取）
-        csv_text = "\n".join(symbols) + "\n"
+        # 区域清单一并上传（供 Worker /universe 读取）——始终用完整清单，避免 batch 覆盖
+        csv_text = "\n".join(all_symbols) + "\n"
         r2store.put_universe(reg, csv_text)
-        print(f"[区域] {reg} 清单已上传 universe/{reg}.csv", flush=True)
+        print(f"[区域] {reg} 完整清单已上传 universe/{reg}.csv", flush=True)
 
     # 全局状态
     r2store.put_status(
