@@ -143,6 +143,11 @@ def _parse_chart(data: dict, symbol: str, interval: str) -> pd.DataFrame:
     df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
     # 去掉时区，与现有入库文件一致（本地文件为 naive）
     df.index = df.index.tz_localize(None)
-    df.index.name = "Datetime" if interval.endswith("m") or interval.endswith("h") else "Date"
+    if interval == "1d":
+        # 日K归一化到纯日期（去掉雅虎附带的盘中时间戳）
+        df.index = df.index.normalize()
+        df.index.name = "Date"
+    else:
+        df.index.name = "Datetime"
     df = df.dropna(subset=["Close"])
     return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
