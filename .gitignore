@@ -21,6 +21,7 @@ SECRETS.md
 
 # Node（api/ 的依赖，仅提交源码）
 api/node_modules/
+api/dist/
 
 # 本地临时文件
 scripts/_test_*.py

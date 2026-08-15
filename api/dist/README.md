@@ -1,1 +1,0 @@
-This folder contains the built output assets for the worker "market-data-api" generated at 2026-08-15T14:19:11.537Z.
