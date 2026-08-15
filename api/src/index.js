@@ -1,9 +1,9 @@
 /**
  * 行情数据动态接口（Cloudflare Worker）
  *
- * 免费托管在 Cloudflare Workers（无需服务器），数据直接读取本仓库
- * （448776129/market-data-pipeline）由 GitHub Actions 生成的 CSV / JSON 文件，
- * 在边缘节点解析并转成 JSON 返回。
+ * 免费托管在 Cloudflare Workers（无需服务器），数据由 GitHub Actions 自动采集
+ * 并存入 Cloudflare R2（gzip 压缩），本 Worker 在边缘节点从 R2 读取、
+ * 自动解压 gzip 并解析转成 JSON 返回。
  *
  * 部署：见 api/README.md
  *
@@ -571,7 +571,7 @@ const HOME_HTML = `<!DOCTYPE html>
 <header class="hero"><div class="wrap">
   <div class="badge"><span class="pulse"></span> 免费 · 无需 Key · 全球市场 · 边缘分发</div>
   <h1>免费行情 K 线<br>数据 <span class="grad">接口</span></h1>
-  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股 / 美股 / 港股 / 韩股 核心指数成分股的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线，通过 <b>Cloudflare Workers</b> 在边缘节点转成 JSON 返回，零服务器成本，供量化系统直接调用。</p>
+  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股 / 美股 / 港股 / 韩股 核心指数成分股的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线（美股含盘前盘后延长时段），gzip 压缩存入 <b>Cloudflare R2</b>，由 <b>Cloudflare Workers</b> 在边缘节点自动解压并转成 JSON / CSV 返回，零服务器成本，供量化系统直接调用。</p>
   <div class="codes">
     <div class="code"><span class="cmt"># 一行请求，返回 AAPL 最近 5 条日K</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</span>"</div>
     <div class="code"><span class="cmt"># 个股信息（名称 / 行业 / 市值 / 最新价）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/quote?symbol=600519.SS</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/universe?index=csi300</span>"</div>
