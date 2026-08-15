@@ -9,8 +9,8 @@ name: Sync Data (Incremental)
 
 on:
   schedule:
-    # 每 1 小时（北京时间约 8 点起）
-    - cron: "0 * * * *"
+    # 每 30 分钟增量同步（脚本内含查重：休市/数据新鲜自动跳过，不浪费请求）
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       region:
@@ -84,10 +84,11 @@ jobs:
           FETCH_CONCURRENCY: "8"
         run: python scripts/sync_incremental.py --region us --batch ${{ matrix.batch }} --batches 4
 
-  # ============ 港股恒生（88 只） ============
-  sync-hk:
-    name: Sync · 恒生指数
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'hk')) }}
+  # ============ 小市场合并：港股恒生 + 韩股KOSPI200 + 美股ETF + 中国ETF ============
+  # 4 个区域共约 701 只，合并为 1 个 job 串行处理，减少 Actions job 启动开销。
+  sync-others:
+    name: Sync · 港股+韩股+美股ETF+中国ETF
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'hk' || github.event.inputs.region == 'kr' || github.event.inputs.region == 'etf' || github.event.inputs.region == 'cn_etf')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,75 +97,18 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Sync -> R2 (hk)
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: python scripts/sync_incremental.py --region hk
-
-  # ============ 韩股 KOSPI200（48 只） ============
-  sync-kr:
-    name: Sync · KOSPI200
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'kr')) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Sync -> R2 (kr)
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: python scripts/sync_incremental.py --region kr
-
-  # ============ 美股 ETF（355 只） ============
-  sync-etf:
-    name: Sync · 美股ETF
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'etf')) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Sync -> R2 (etf)
+      - name: Sync -> R2 (hk + kr + etf + cn_etf)
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           FETCH_CONCURRENCY: "8"
-        run: python scripts/sync_incremental.py --region etf
-
-  # ============ 中国（A股）ETF（211 只） ============
-  sync-cn-etf:
-    name: Sync · 中国ETF
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'cn_etf')) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Sync -> R2 (cn_etf)
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          FETCH_CONCURRENCY: "8"
-        run: python scripts/sync_incremental.py --region cn_etf
+        run: |
+          python scripts/sync_incremental.py --region hk
+          python scripts/sync_incremental.py --region kr
+          python scripts/sync_incremental.py --region etf
+          python scripts/sync_incremental.py --region cn_etf
 
   # ============ 失败告警（任一 sync job 失败时通知） ============
   # 配置方式：仓库 Settings → Secrets → 添加 ALERT_WEBHOOK_URL（如 Slack/Discord/Server酱 webhook）
@@ -173,7 +117,7 @@ jobs:
     name: Alert · 增量同步失败
     if: ${{ failure() }}
     runs-on: ubuntu-latest
-    needs: [sync-cn, sync-us, sync-hk, sync-kr, sync-etf, sync-cn-etf]
+    needs: [sync-cn, sync-us, sync-others]
     steps:
       - name: Send failure alert
         env:

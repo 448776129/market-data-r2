@@ -26,7 +26,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -103,23 +103,31 @@ def merge_and_upload(region: str, symbol: str, interval: str, fresh: pd.DataFram
     return max(added, 0)
 
 
+def utc_now() -> pd.Timestamp:
+    """当前 UTC 时间（naive，与 R2 中分钟K索引时区一致）。"""
+    return pd.Timestamp.now(timezone.utc).tz_localize(None)
+
+
 def fetch_incremental(region: str, symbol: str, interval: str) -> int:
     """拉取单只股票指定周期增量并合并上传，返回新增行数。"""
     index_col = DATE_COL if interval == "1d" else DT_COL
     existing = load_existing(region, symbol, interval, index_col)
 
-    now = marketlib.region_now(region)
+    now_local = marketlib.region_now(region)
+    now_utc = utc_now()
 
-    # ---- 增量查重：休市且数据最新则跳过 ----
+    # ---- 增量查重：数据已最新/新鲜则跳过请求，避免重复拉取 ----
     if existing is not None and not existing.empty:
         last_ts = existing.index.max()
+        in_session = marketlib.is_market_session(region, now_local)
+
         if interval == "1d":
-            # 日K：仅在非交易时段跳过（避免盘中跳过导致收盘bar停留在实时值）
-            recent_cutoff = now.date() - timedelta(days=2)
-            if (
-                not marketlib.is_market_session(region, now)
-                and last_ts.date() >= recent_cutoff
-            ):
+            # 日K：
+            #  - 非交易时段（收盘后/休市）：若已有最近 2 个自然日内数据 → 跳过
+            #    （交易日收盘bar已入库；周末时周五bar视为最新）
+            #  - 交易时段内：总是拉取（保证当日实时bar与收盘bar）
+            recent_cutoff = now_local.date() - timedelta(days=2)
+            if not in_session and last_ts.date() >= recent_cutoff:
                 return 0
             # 精确增量：从最后日期往回看缓冲段
             start = (last_ts - pd.Timedelta(days=DAILY_BUFFER_DAYS)).date()
@@ -127,7 +135,16 @@ def fetch_incremental(region: str, symbol: str, interval: str) -> int:
                 symbol, interval="1d", start=start, prepost=False
             )
         else:
-            # 分钟K：交易时段外整批跳过由 run() 处理；此处只做时间增量
+            # 分钟K：
+            #  - 非交易时段 → 跳过（run() 已整批跳过，此处双保险）
+            #  - 交易时段内但数据新鲜（最后时间点距今 < 运行间隔）→ 跳过，
+            #    避免每半小时重复拉取同一批分钟K
+            if not in_session:
+                return 0
+            minutes_since = (now_utc - last_ts).total_seconds() / 60
+            if minutes_since < config.INCREMENTAL_MIN_INTERVAL_MINUTES:
+                return 0
+            # 增量：从最后时间点往回看缓冲段
             start = last_ts - pd.Timedelta(days=config.INTRADAY_BUFFER_DAYS)
             fresh = yahoo_chart.fetch_kline(
                 symbol, interval=interval, start=start, prepost=True
@@ -158,6 +175,9 @@ def sync_minute_and_derived(region: str, symbol: str) -> int:
     added = 0
     for interval in SOURCE_INTERVALS:
         added += fetch_incremental(region, symbol, interval)
+    # 若无新增分钟数据，说明 1m 足够新鲜，派生K线也不会变，跳过重采样
+    if added <= 0:
+        return 0
 
     # 由 1m 增量合并后的数据重采样派生 5m/15m/30m
     m1 = load_existing(region, symbol, "1m", DT_COL)
