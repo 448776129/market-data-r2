@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: "限定区域：all=全部, us/cn/hk/kr=单区域"
+        description: "限定区域：all=全部, us/cn/hk/kr/etf=单区域"
         required: false
         default: "all"
         type: choice
@@ -19,6 +19,7 @@ on:
           - cn
           - hk
           - kr
+          - etf
 
 env:
   PYTHON_VERSION: "3.11"
@@ -92,3 +93,23 @@ jobs:
         run: |
           python scripts/fetch_meta.py --region hk
           python scripts/fetch_meta.py --region kr
+
+  fetch-meta-etf:
+    name: Meta · 美股ETF
+    if: ${{ github.event.inputs.region == 'all' || github.event.inputs.region == 'etf' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch meta -> R2 (etf)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          FETCH_CONCURRENCY: "10"
+        run: python scripts/fetch_meta.py --region etf

@@ -21,11 +21,13 @@ from __future__ import annotations
 #   - cn: 沪深 A 股全市场（沪市 GPLIST.xls + 深市 A股列表.xlsx，4595 只）
 #   - hk: 恒生指数全部成分股（hsi.csv，88 只）
 #   - kr: KOSPI 200 前 50 核心成分股（build_universe.KR_CODES，48 只）
+#   - etf: 美股 ETF 集合（用户指定 355 只，data/universe/etf.csv）
 REGIONS: dict[str, list[str]] = {
     "us": [],  # 全市场模式：从 data/universe/us.csv 读取全部美股
     "hk": [],  # 全市场模式：从 data/universe/hk.csv 读取全部港股
     "cn": [],  # 全市场模式：从 data/universe/cn.csv 读取全部A股(沪+深)
     "kr": [],  # 全市场模式：从 data/universe/kr.csv 读取全部韩股
+    "etf": [],  # 美股 ETF：从 data/universe/etf.csv 读取
 }
 
 # 历史数据拉取范围（yfinance period 参数）
@@ -47,6 +49,7 @@ UNIVERSE_FILES = {
     "cn": "cn.csv",
     "hk": "hk.csv",
     "kr": "kr.csv",
+    "etf": "etf.csv",
 }
 
 # 请求间隔（秒）：控制对 Yahoo 的请求频率，避免触发限流导致 429/404
@@ -125,6 +128,7 @@ REGION_TZ = {
     "hk": "Asia/Hong_Kong",
     "kr": "Asia/Seoul",
     "us": "America/New_York",
+    "etf": "America/New_York",  # ETF 在美股市场交易
 }
 # 各区域可能产生新K线的时段（该市场本地时间，分钟），可多段：
 #  - cn: 9:15-11:30, 13:00-15:05（含集合竞价，剔除午休）
@@ -136,4 +140,5 @@ MARKET_SESSIONS: dict[str, tuple[tuple[int, int], ...]] = {
     "hk": ((9 * 60 + 15, 12 * 60), (13 * 60, 16 * 60 + 10)),
     "kr": ((9 * 60, 15 * 60 + 30),),
     "us": ((4 * 60, 20 * 60),),
+    "etf": ((4 * 60, 20 * 60),),  # 与美股相同
 }

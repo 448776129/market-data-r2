@@ -48,6 +48,7 @@ const REGION_LABEL = {
   us: "美股",
   hk: "港股",
   kr: "韩股",
+  etf: "美股ETF",
 };
 
 // 指数/清单 -> 中文名（universe/*.csv 文件名）
@@ -61,6 +62,7 @@ const INDEX_LABEL = {
   us: "美股全部",
   hk: "港股全部",
   kr: "韩股全部",
+  etf: "美股ETF",
 };
 
 // 从代码后缀推断区域；裸代码默认美股
@@ -750,15 +752,15 @@ const HOME_HTML = `<!DOCTYPE html>
 <header class="hero"><div class="wrap">
   <div class="badge"><span class="pulse"></span> 免费 · 无需 Key · 全球市场 · 边缘分发 · 实时价格</div>
   <h1>免费行情 K 线<br>数据 <span class="grad">接口</span></h1>
-  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股全市场(4595) / 美股Russell1000(1022) / 港股恒生(87) / 韩股KOSPI200(48) 的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线（美股含盘前盘后延长时段），gzip 压缩存入 <b>Cloudflare R2</b>，由 <b>Cloudflare Workers</b> 在边缘节点自动解压并转成 JSON / CSV 返回；<b>/price</b> 实时价格当场调取 Yahoo API，零服务器成本，供量化系统直接调用。</p>
+  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股全市场(4595) / 美股Russell1000(1022) / 港股恒生(87) / 韩股KOSPI200(48) / <b>美股ETF(355)</b> 的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线（美股含盘前盘后延长时段），gzip 压缩存入 <b>Cloudflare R2</b>，由 <b>Cloudflare Workers</b> 在边缘节点自动解压并转成 JSON / CSV 返回；<b>/price</b> 实时价格当场调取 Yahoo API，零服务器成本，供量化系统直接调用。</p>
   <div class="codes">
     <div class="code"><span class="cmt"># 一行请求，返回 AAPL 最近 5 条日K（历史数据走 R2）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</span>"</div>
     <div class="code"><span class="cmt"># 实时价格（当场调取 Yahoo，非缓存）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/price?symbol=AAPL</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/price?symbol=600519.SS</span>"</div>
   </div>
   <div class="stat-band">
-    <div class="stat"><div class="n">5752</div><div class="l">股票（A股全市场/美股Russell1000/恒生/KOSPI200）</div></div>
+    <div class="stat"><div class="n">6107</div><div class="l">股票 + ETF（A股/美股/恒生/KOSPI200/美股ETF）</div></div>
     <div class="stat"><div class="n">6</div><div class="l">周期（日K/1m/5m/15m/30m/1h）</div></div>
-    <div class="stat"><div class="n">4</div><div class="l">市场（A股/美股/港股/韩股）</div></div>
+    <div class="stat"><div class="n">5</div><div class="l">市场（A股/美股/港股/韩股/美股ETF）</div></div>
     <div class="stat"><div class="n">0</div><div class="l">费用（公开仓库 + Workers 免费额度）</div></div>
   </div>
 </div></header>
