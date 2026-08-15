@@ -748,15 +748,15 @@ const HOME_HTML = `<!DOCTYPE html>
 </div></nav>
 
 <header class="hero"><div class="wrap">
-  <div class="badge"><span class="pulse"></span> 免费 · 无需 Key · 全球市场 · 边缘分发</div>
+  <div class="badge"><span class="pulse"></span> 免费 · 无需 Key · 全球市场 · 边缘分发 · 实时价格</div>
   <h1>免费行情 K 线<br>数据 <span class="grad">接口</span></h1>
-  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股 / 美股 / 港股 / 韩股 核心指数成分股的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线（美股含盘前盘后延长时段），gzip 压缩存入 <b>Cloudflare R2</b>，由 <b>Cloudflare Workers</b> 在边缘节点自动解压并转成 JSON / CSV 返回，零服务器成本，供量化系统直接调用。</p>
+  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股全市场(4595) / 美股Russell1000(1022) / 港股恒生(87) / 韩股KOSPI200(48) 的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线（美股含盘前盘后延长时段），gzip 压缩存入 <b>Cloudflare R2</b>，由 <b>Cloudflare Workers</b> 在边缘节点自动解压并转成 JSON / CSV 返回；<b>/price</b> 实时价格当场调取 Yahoo API，零服务器成本，供量化系统直接调用。</p>
   <div class="codes">
-    <div class="code"><span class="cmt"># 一行请求，返回 AAPL 最近 5 条日K</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</span>"</div>
-    <div class="code"><span class="cmt"># 个股信息（名称 / 行业 / 市值 / 最新价）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/quote?symbol=600519.SS</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/universe?index=csi300</span>"</div>
+    <div class="code"><span class="cmt"># 一行请求，返回 AAPL 最近 5 条日K（历史数据走 R2）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</span>"</div>
+    <div class="code"><span class="cmt"># 实时价格（当场调取 Yahoo，非缓存）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/price?symbol=AAPL</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/price?symbol=600519.SS</span>"</div>
   </div>
   <div class="stat-band">
-    <div class="stat"><div class="n">8000+</div><div class="l">成分股（沪深300/中证500/纳指100/标普500/恒生）</div></div>
+    <div class="stat"><div class="n">5752</div><div class="l">股票（A股全市场/美股Russell1000/恒生/KOSPI200）</div></div>
     <div class="stat"><div class="n">6</div><div class="l">周期（日K/1m/5m/15m/30m/1h）</div></div>
     <div class="stat"><div class="n">4</div><div class="l">市场（A股/美股/港股/韩股）</div></div>
     <div class="stat"><div class="n">0</div><div class="l">费用（公开仓库 + Workers 免费额度）</div></div>
@@ -768,6 +768,7 @@ const HOME_HTML = `<!DOCTYPE html>
   <div class="demo">
     <div class="demo-tabs">
       <div class="demo-tab on" data-t="kline">kline</div>
+      <div class="demo-tab" data-t="price">price</div>
       <div class="demo-tab" data-t="quote">quote</div>
       <div class="demo-tab" data-t="universe">universe</div>
     </div>
@@ -785,6 +786,7 @@ const HOME_HTML = `<!DOCTYPE html>
           </select>
         </div>
         <div class="field" data-f="kline"><label>limit</label><input id="lim" value="10" type="number" min="1"></div>
+        <div class="field" data-f="price" style="display:none"><label>symbol</label><input id="psym" value="AAPL" spellcheck="false"></div>
         <div class="field" data-f="quote" style="display:none"><label>symbol</label><input id="qsym" value="0700.HK" spellcheck="false"></div>
         <div class="field" data-f="universe" style="display:none"><label>index</label>
           <select id="uidx">
@@ -797,7 +799,7 @@ const HOME_HTML = `<!DOCTYPE html>
         </div>
         <button class="run" id="go">运行请求</button>
       </div>
-      <div class="demo-out"><pre id="out"><span class="dim">// 在左侧输入参数，点击「运行请求」查看返回结果。&#10;// kline：AAPL / 0700.HK / 600519.SS / 000001.SZ&#10;// quote：获取个股名称、行业、市值、最新价等&#10;// universe：获取指数成分股代码清单</span></pre></div>
+      <div class="demo-out"><pre id="out"><span class="dim">// 在左侧输入参数，点击「运行请求」查看返回结果。&#10;// kline：历史K线（走 R2） AAPL / 0700.HK / 600519.SS / 000001.SZ&#10;// price：实时价格（当场调取 Yahoo） AAPL / 600519.SS / 005930.KS&#10;// quote：个股名称、行业、市值、最新价等&#10;// universe：获取指数成分股代码清单</span></pre></div>
     </div>
   </div>
 </div></section>
@@ -990,6 +992,8 @@ const HOME_HTML = `<!DOCTYPE html>
       q="/quote?symbol="+encodeURIComponent(document.getElementById("qsym").value.trim()||"0700.HK");
     }else if(active==="universe"){
       q="/universe?index="+encodeURIComponent(document.getElementById("uidx").value);
+    }else if(active==="price"){
+      q="/price?symbol="+encodeURIComponent(document.getElementById("psym").value.trim()||"AAPL");
     }else{
       var s=document.getElementById("sym").value.trim()||"AAPL";
       var i=document.getElementById("itv").value;
