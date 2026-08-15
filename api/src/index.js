@@ -1,0 +1,786 @@
+/**
+ * 行情数据动态接口（Cloudflare Worker）
+ *
+ * 免费托管在 Cloudflare Workers（无需服务器），数据直接读取本仓库
+ * （448776129/market-data-pipeline）由 GitHub Actions 生成的 CSV / JSON 文件，
+ * 在边缘节点解析并转成 JSON 返回。
+ *
+ * 部署：见 api/README.md
+ *
+ * 路由：
+ *   GET /                                            → 项目介绍 + API 文档主页（HTML）
+ *   GET /kline?symbol=AAPL&interval=1d&limit=5       → K线数据（日K/1m/5m/15m/30m/1h）
+ *   GET /quote?symbol=0700.HK                        → 个股元数据（名称/行业/市值/最新价…）
+ *   GET /universe?index=csi300                       → 指数成分股清单
+ *   GET /indices                                     → 可用的指数/清单及其成分数量
+ *   GET /symbols?region=cn&limit=10&offset=0         → 按区域列出股票代码
+ *   GET /status                                      → 数据仓库配置信息
+ */
+
+// 数据仓库信息（与 git remote 一致）
+const REPO_OWNER = "448776129";
+const REPO_NAME = "market-data-pipeline";
+const REPO_BRANCH = "master";
+
+// 对外接口域名（自定义域）
+const API_BASE = "https://stockapi.365200.xyz";
+
+// interval -> data 子目录映射
+const INTERVAL_DIR = {
+  "1d": "kline",
+  "1m": "kline_1m",
+  "5m": "kline_5m",
+  "15m": "kline_15m",
+  "30m": "kline_30m",
+  "1h": "kline_1h",
+};
+
+// 区域 -> 中文名（用于文档/展示）
+const REGION_LABEL = {
+  cn: "A股",
+  us: "美股",
+  hk: "港股",
+  kr: "韩股",
+};
+
+// 指数/清单 -> 中文名（universe/*.csv 文件名）
+const INDEX_LABEL = {
+  csi300: "沪深300",
+  csi500: "中证500",
+  nasdaq100: "纳斯达克100",
+  sp500: "标普500",
+  hsi: "恒生指数",
+  cn: "A股全部",
+  us: "美股全部",
+  hk: "港股全部",
+  kr: "韩股全部",
+};
+
+// 从代码后缀推断区域；裸代码默认美股
+function inferRegion(symbol) {
+  const s = symbol.toUpperCase();
+  if (s.endsWith(".HK")) return "hk";
+  if (s.endsWith(".KS") || s.endsWith(".KQ")) return "kr";
+  if (s.endsWith(".SS") || s.endsWith(".SZ")) return "cn";
+  return "us";
+}
+
+// 解析 CSV 文本为对象数组（首行表头）
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== "");
+  if (lines.length === 0) return [];
+  const header = splitLine(lines[0]);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitLine(lines[i]);
+    if (cells.length === 0) continue;
+    const obj = {};
+    for (let j = 0; j < header.length; j++) {
+      obj[header[j]] = cells[j] !== undefined ? cells[j] : "";
+    }
+    rows.push(obj);
+  }
+  return rows;
+}
+
+// 简易 CSV 行切分（处理带引号字段）
+function splitLine(line) {
+  const out = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// 统一响应头（允许跨域调用）
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Cache-Control": "public, max-age=60",
+  };
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() },
+  });
+}
+
+function error(msg, status = 400) {
+  return json({ error: msg }, status);
+}
+
+function html(text, status = 200) {
+  return new Response(text, {
+    status,
+    headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders() },
+  });
+}
+
+// 读取数据：优先从 R2（MARKET_DATA_R2 binding）读取，失败时 fallback 到 GitHub raw。
+// path 形如 "data/{region}/kline/{symbol}.csv"，R2 中对象键为 "{region}/kline/{symbol}.csv"。
+// R2 中的 K 线 CSV 为 gzip 压缩存储（.gz 或 Content-Encoding: gzip），自动解压。
+async function fetchUpstream(path, env) {
+  // 1) 优先 R2：去掉 "data/" 前缀即 R2 对象键
+  if (env && env.MARKET_DATA_R2) {
+    try {
+      const r2key = path.replace(/^data\//, "");
+      const obj = await env.MARKET_DATA_R2.get(r2key);
+      if (obj) {
+        const bytes = await obj.arrayBuffer();
+        const data = new Uint8Array(bytes);
+        const gzipMagic = data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
+        const enc = obj.httpMetadata && (obj.httpMetadata.contentEncoding || "");
+        if (gzipMagic || enc === "gzip" || r2key.endsWith(".gz")) {
+          // 解压 gzip
+          const ds = new DecompressionStream("gzip");
+          const stream = new Blob([data]).stream().pipeThrough(ds);
+          const buf = await new Response(stream).arrayBuffer();
+          return new TextDecoder().decode(buf);
+        }
+        return new TextDecoder().decode(data);
+      }
+    } catch (e) {
+      // R2 读取失败则尝试 GitHub raw
+      console.warn(`R2 read failed for ${path}: ${e.message}`);
+    }
+  }
+
+  // 2) fallback：GitHub raw
+  const url = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${path}`;
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    throw new Error(`upstream fetch failed: ${e.message}`);
+  }
+  if (resp.status === 404) {
+    return null;
+  }
+  if (!resp.ok) {
+    throw new Error(`upstream error: ${resp.status}`);
+  }
+  return await resp.text();
+}
+
+// 数值/日期过滤预备：返回比较用的时间戳
+function tsOf(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
+// ============================================================
+// K线数据
+// ============================================================
+async function handleKline(params, env) {
+  const symbol = (params.get("symbol") || "").trim().toUpperCase();
+  if (!symbol) {
+    return json({
+      usage: {
+        endpoint: `${API_BASE}/kline`,
+        description: "查询任意股票K线数据（日K / 1m / 5m / 15m / 30m / 1h）",
+        params: {
+          symbol: "股票代码（必填），如 AAPL / 0700.HK / 600519.SS / 000001.SZ",
+          interval: `周期，默认 1d。可选：${Object.keys(INTERVAL_DIR).join(" / ")}`,
+          start: "起始日期 YYYY-MM-DD（含）",
+          end: "结束日期 YYYY-MM-DD（含）",
+          limit: "最多返回行数；默认返回时间上最新 N 条",
+          order: "asc(默认，时间升序) / desc(最新在前)",
+          format: "json(默认) / csv",
+        },
+        example: `${API_BASE}/kline?symbol=AAPL&interval=1d&start=2024-01-01&end=2024-12-31`,
+      },
+    });
+  }
+
+  const interval = (params.get("interval") || "1d").toLowerCase();
+  if (!INTERVAL_DIR[interval]) {
+    return error(`Invalid interval: ${interval}. Allowed: ${Object.keys(INTERVAL_DIR).join(", ")}`);
+  }
+
+  const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
+  const limit = parseInt(params.get("limit") || "0", 10);
+  const format = (params.get("format") || "json").toLowerCase();
+  const startTs = tsOf(params.get("start"));
+  const endTs = tsOf(params.get("end"));
+
+  const dir = INTERVAL_DIR[interval];
+  const text = await fetchUpstream(`data/${region}/${dir}/${symbol}.csv`, env);
+  if (text === null) {
+    return error(
+      `No data for ${symbol} (${interval}). File not found: data/${region}/${dir}/${symbol}.csv`,
+      404
+    );
+  }
+
+  if (format === "csv") {
+    return new Response(text, {
+      status: 200,
+      headers: { "Content-Type": "text/csv; charset=utf-8", ...corsHeaders() },
+    });
+  }
+
+  let rows = parseCSV(text);
+  const indexCol = interval === "1d" ? "Date" : "Datetime";
+
+  if (startTs !== null || endTs !== null) {
+    rows = rows.filter((r) => {
+      const t = tsOf(r[indexCol]);
+      if (t === null) return true;
+      if (startTs !== null && t < startTs) return false;
+      if (endTs !== null && t > endTs) return false;
+      return true;
+    });
+  }
+
+  const order = (params.get("order") || "asc").toLowerCase();
+  if (order === "desc") {
+    rows.reverse();
+  }
+
+  if (limit > 0) {
+    rows = order === "desc" ? rows.slice(0, limit) : rows.slice(-limit);
+  }
+
+  return json({ symbol, region, interval, count: rows.length, order, data: rows });
+}
+
+// ============================================================
+// 个股元数据（quote）
+// ============================================================
+async function handleQuote(params, env) {
+  const symbol = (params.get("symbol") || "").trim().toUpperCase();
+  if (!symbol) {
+    return json({
+      usage: {
+        endpoint: `${API_BASE}/quote`,
+        description: "查询个股元数据（公司名/行业/市值/最新价等）",
+        params: { symbol: "股票代码（必填）" },
+        example: `${API_BASE}/quote?symbol=AAPL`,
+      },
+    });
+  }
+
+  const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
+  const text = await fetchUpstream(`data/${region}/meta/${symbol}.json`, env);
+  if (text === null) {
+    return error(`No meta for ${symbol}. File not found: data/${region}/meta/${symbol}.json`, 404);
+  }
+
+  let meta;
+  try {
+    meta = JSON.parse(text);
+  } catch {
+    return error(`Invalid meta JSON for ${symbol}`, 502);
+  }
+
+  const info = meta.info || {};
+  const pick = [
+    "longName", "shortName", "sector", "industry", "country", "exchange",
+    "currency", "marketCap", "currentPrice", "open", "previousClose",
+    "dayHigh", "dayLow", "regularMarketPrice", "regularMarketPreviousClose",
+    "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "trailingPE", "forwardPE",
+    "priceToBook", "dividendYield", "dividendRate", "trailingEps",
+    "fiftyDayAverage", "twoHundredDayAverage", "totalRevenue", "freeCashflow",
+  ];
+  const quote = {};
+  for (const k of pick) {
+    if (info[k] !== undefined && info[k] !== null) quote[k] = info[k];
+  }
+
+  return json({
+    symbol: meta.symbol,
+    region: meta.region,
+    name: meta.name,
+    currency: meta.currency,
+    exchange: meta.exchange,
+    isin: meta.isin || null,
+    quote,
+  });
+}
+
+// ============================================================
+// 指数成分股 / 清单
+// ============================================================
+async function handleUniverse(params, env) {
+  const index = (params.get("index") || "").trim().toLowerCase();
+  if (!index) {
+    return json({
+      usage: {
+        endpoint: `${API_BASE}/universe`,
+        description: "获取指定指数/清单的成分股代码",
+        params: {
+          index: `必填。可选：${Object.keys(INDEX_LABEL).join(" / ")}`,
+        },
+        example: `${API_BASE}/universe?index=csi300`,
+      },
+    });
+  }
+  if (!INDEX_LABEL[index]) {
+    return error(`Invalid index: ${index}. Allowed: ${Object.keys(INDEX_LABEL).join(", ")}`);
+  }
+
+  const text = await fetchUpstream(`data/universe/${index}.csv`, env);
+  if (text === null) {
+    return error(`No universe file: data/universe/${index}.csv`, 404);
+  }
+
+  // universe 文件为每行一个股票代码（无表头）
+  const symbols = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== "" && !l.startsWith("#"));
+
+  return json({
+    index,
+    name: INDEX_LABEL[index],
+    count: symbols.length,
+    symbols,
+  });
+}
+
+// ============================================================
+// 可用指数/清单列表
+// ============================================================
+async function handleIndices(env) {
+  const names = Object.keys(INDEX_LABEL);
+  const items = [];
+  for (const name of names) {
+    try {
+      const text = await fetchUpstream(`data/universe/${name}.csv`, env);
+      const count = text === null ? 0 : text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("#")).length;
+      items.push({ index: name, name: INDEX_LABEL[name], count });
+    } catch {
+      items.push({ index: name, name: INDEX_LABEL[name], count: 0 });
+    }
+  }
+  return json({ base: API_BASE, indices: items });
+}
+
+// ============================================================
+// 按区域列出股票代码
+// ============================================================
+async function handleSymbols(params, env) {
+  const region = (params.get("region") || "").trim().toLowerCase() || "us";
+  if (!REGION_LABEL[region]) {
+    return error(`Invalid region: ${region}. Allowed: ${Object.keys(REGION_LABEL).join(", ")}`);
+  }
+  const limit = Math.min(parseInt(params.get("limit") || "100", 10), 1000);
+  const offset = Math.max(parseInt(params.get("offset") || "0", 10), 0);
+
+  const text = await fetchUpstream(`data/universe/${region}.csv`, env);
+  if (text === null) {
+    return error(`No universe file: data/universe/${region}.csv`, 404);
+  }
+
+  const symbols = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== "" && !l.startsWith("#"));
+
+  const page = symbols.slice(offset, offset + limit);
+  return json({
+    region,
+    region_name: REGION_LABEL[region],
+    total: symbols.length,
+    offset,
+    limit,
+    count: page.length,
+    symbols: page,
+  });
+}
+
+// ============================================================
+// 状态
+// ============================================================
+function handleStatus() {
+  return json({
+    service: "StockAPI",
+    base: API_BASE,
+    repo: `${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}`,
+    endpoints: {
+      kline: `${API_BASE}/kline`,
+      quote: `${API_BASE}/quote`,
+      universe: `${API_BASE}/universe`,
+      indices: `${API_BASE}/indices`,
+      symbols: `${API_BASE}/symbols`,
+    },
+    intervals: Object.keys(INTERVAL_DIR),
+    regions: Object.keys(REGION_LABEL),
+    indexes: Object.keys(INDEX_LABEL),
+    note: "数据由 GitHub Actions 自动增量采集，5m/15m/30m 由 1m 重采样计算，1h 为雅虎原生小时K线。",
+  });
+}
+
+// ============================================================
+// 首页：项目介绍 + API 文档 + 在线演示（自包含单页）
+// ============================================================
+const HOME_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="StockAPI — 免费行情K线数据接口，基于 GitHub Actions 自动采集 + Cloudflare Workers 边缘分发">
+<title>StockAPI · 免费行情K线接口</title>
+<style>
+  :root{
+    --bg:#070a0f; --panel:#0e141d; --panel2:#121a26; --line:#1e293b;
+    --text:#e6edf3; --muted:#8b98a9; --dim:#5b6675;
+    --accent:#34d399; --accent2:#22d3a5; --amber:#fbbf24; --red:#f87171; --blue:#60a5fa;
+    --mono:ui-monospace,"SF Mono","SFMono-Regular",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  a{color:var(--accent2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:var(--mono)}
+  ::selection{background:rgba(52,211,153,.25)}
+
+  nav{position:sticky;top:0;z-index:50;background:rgba(7,10,15,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
+  .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent)}
+  .brand b{font-family:var(--mono)}
+  .nav-links{display:flex;gap:22px;font-size:14px;color:var(--muted)}
+  .nav-links a{color:var(--muted)}
+  .nav-links a:hover{color:var(--text);text-decoration:none}
+
+  .hero{padding:88px 0 52px}
+  .badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;color:var(--accent);border:1px solid rgba(52,211,153,.3);background:rgba(52,211,153,.08);padding:5px 12px;border-radius:999px;margin-bottom:22px}
+  .badge .pulse{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  h1{font-size:clamp(30px,5vw,52px);line-height:1.1;letter-spacing:-.02em;font-weight:800}
+  h1 .grad{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{margin-top:18px;font-size:17px;color:var(--muted);max-width:680px}
+  .codes{margin-top:30px;display:grid;gap:12px}
+  .code{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-family:var(--mono);font-size:13.5px;overflow-x:auto;white-space:nowrap}
+  .code .cmt{color:var(--dim)}
+  .code .cmd{color:var(--accent)}
+  .code .url{color:var(--text)}
+  .stat-band{margin-top:40px;display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .stat .n{font-family:var(--mono);font-size:26px;font-weight:700;color:var(--accent)}
+  .stat .l{font-size:12.5px;color:var(--muted);margin-top:2px}
+
+  section{padding:52px 0}
+  .sec-head{display:flex;align-items:baseline;gap:12px;margin-bottom:26px}
+  .sec-head .idx{font-family:var(--mono);color:var(--accent);font-size:13px}
+  .sec-head h2{font-size:24px;font-weight:700;letter-spacing:-.01em}
+  .sec-head .tag{font-size:12px;color:var(--dim);font-family:var(--mono)}
+
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:22px}
+  .chip{font-family:var(--mono);font-size:12px;color:var(--muted);border:1px solid var(--line);background:var(--panel);padding:5px 11px;border-radius:999px}
+  .chip b{color:var(--accent)}
+
+  .demo{background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  .demo-tabs{display:flex;gap:4px;padding:10px 12px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .demo-tab{font-family:var(--mono);font-size:12.5px;color:var(--muted);padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;border-bottom:2px solid transparent}
+  .demo-tab.on{color:var(--accent);border-bottom-color:var(--accent);background:rgba(52,211,153,.06)}
+  .demo-body{display:grid;grid-template-columns:340px 1fr}
+  .demo-form{padding:20px;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:14px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-family:var(--mono)}
+  .field input,.field select{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:10px 12px;font-family:var(--mono);font-size:13px;outline:none}
+  .field input:focus,.field select:focus{border-color:var(--accent)}
+  .run{background:var(--accent);color:#03251a;border:none;border-radius:8px;padding:11px;font-family:var(--mono);font-weight:700;font-size:14px;cursor:pointer;transition:filter .15s}
+  .run:hover{filter:brightness(1.08)}
+  .run:active{transform:translateY(1px)}
+  .demo-out{padding:0;margin:0;background:#0a0f16;font-family:var(--mono);font-size:12.5px;line-height:1.7;overflow:auto;max-height:460px}
+  .demo-out pre{padding:20px;white-space:pre-wrap;word-break:break-word}
+  .demo-out .ok{color:var(--accent)}
+  .demo-out .err{color:var(--red)}
+  .demo-out .dim{color:var(--dim)}
+
+  .table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+  table{width:100%;border-collapse:collapse;font-size:14px;min-width:640px}
+  th,td{text-align:left;padding:11px 16px;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--panel);text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  td code{color:var(--accent2);background:rgba(34,211,165,.08);padding:1px 6px;border-radius:5px;font-size:12.5px}
+  td .req{color:var(--red);font-weight:700}
+  td .opt{color:var(--dim)}
+
+  .ep-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .ep{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .ep .m{font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:700}
+  .ep .d{font-size:13px;color:var(--muted);margin-top:4px}
+  .ep .ex{font-family:var(--mono);font-size:12px;color:var(--blue);margin-top:8px;background:var(--panel2);padding:6px 10px;border-radius:8px;overflow-x:auto;white-space:nowrap}
+
+  .fields{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .fcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .fcard h3{font-size:15px;margin-bottom:12px;font-family:var(--mono)}
+  .fcard h3 .tag{font-size:11px;color:var(--dim);font-weight:400}
+  .fcard ul{list-style:none}
+  .fcard li{display:flex;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:13.5px}
+  .fcard li:last-child{border-bottom:none}
+  .fcard .k{font-family:var(--mono);color:var(--accent2);min-width:96px}
+  .fcard .d{color:var(--muted)}
+
+  footer{padding:40px 0 56px;border-top:1px solid var(--line);color:var(--dim);font-size:13px}
+  .foot{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center}
+
+  @media(max-width:860px){
+    .demo-body{grid-template-columns:1fr}
+    .demo-form{border-right:none;border-bottom:1px solid var(--line)}
+    .fields,.ep-grid{grid-template-columns:1fr}
+    .stat-band{grid-template-columns:1fr 1fr}
+    .nav-links{display:none}
+    .hero{padding:60px 0 36px}
+  }
+</style>
+</head>
+<body>
+<nav><div class="wrap nav">
+  <div class="brand"><span class="dot"></span><b>StockAPI</b></div>
+  <div class="nav-links">
+    <a href="#demo">在线演示</a>
+    <a href="#endpoints">接口一览</a>
+    <a href="#api">API 文档</a>
+    <a href="#fields">数据字段</a>
+    <a href="#examples">示例</a>
+  </div>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <div class="badge"><span class="pulse"></span> 免费 · 无需 Key · 全球市场 · 边缘分发</div>
+  <h1>免费行情 K 线<br>数据 <span class="grad">接口</span></h1>
+  <p class="sub">由 <b>GitHub Actions 自动采集</b> A股 / 美股 / 港股 / 韩股 核心指数成分股的 <b>日K、1分钟、5、15、30分钟、1小时</b> K线，通过 <b>Cloudflare Workers</b> 在边缘节点转成 JSON 返回，零服务器成本，供量化系统直接调用。</p>
+  <div class="codes">
+    <div class="code"><span class="cmt"># 一行请求，返回 AAPL 最近 5 条日K</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</span>"</div>
+    <div class="code"><span class="cmt"># 个股信息（名称 / 行业 / 市值 / 最新价）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/quote?symbol=600519.SS</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/universe?index=csi300</span>"</div>
+  </div>
+  <div class="stat-band">
+    <div class="stat"><div class="n">8000+</div><div class="l">成分股（沪深300/中证500/纳指100/标普500/恒生）</div></div>
+    <div class="stat"><div class="n">6</div><div class="l">周期（日K/1m/5m/15m/30m/1h）</div></div>
+    <div class="stat"><div class="n">4</div><div class="l">市场（A股/美股/港股/韩股）</div></div>
+    <div class="stat"><div class="n">0</div><div class="l">费用（公开仓库 + Workers 免费额度）</div></div>
+  </div>
+</div></header>
+
+<section id="demo"><div class="wrap">
+  <div class="sec-head"><span class="idx">01</span><h2>在线演示</h2><span class="tag">GET · JSON</span></div>
+  <div class="demo">
+    <div class="demo-tabs">
+      <div class="demo-tab on" data-t="kline">kline</div>
+      <div class="demo-tab" data-t="quote">quote</div>
+      <div class="demo-tab" data-t="universe">universe</div>
+    </div>
+    <div class="demo-body">
+      <div class="demo-form">
+        <div class="field" data-f="kline"><label>symbol</label><input id="sym" value="AAPL" spellcheck="false"></div>
+        <div class="field" data-f="kline"><label>interval</label>
+          <select id="itv">
+            <option value="1d" selected>1d · 日线</option>
+            <option value="1h">1h · 1小时</option>
+            <option value="30m">30m · 半小时</option>
+            <option value="15m">15m · 15分钟</option>
+            <option value="5m">5m · 5分钟</option>
+            <option value="1m">1m · 1分钟</option>
+          </select>
+        </div>
+        <div class="field" data-f="kline"><label>limit</label><input id="lim" value="10" type="number" min="1"></div>
+        <div class="field" data-f="quote" style="display:none"><label>symbol</label><input id="qsym" value="0700.HK" spellcheck="false"></div>
+        <div class="field" data-f="universe" style="display:none"><label>index</label>
+          <select id="uidx">
+            <option value="csi300" selected>csi300 · 沪深300</option>
+            <option value="csi500">csi500 · 中证500</option>
+            <option value="nasdaq100">nasdaq100 · 纳指100</option>
+            <option value="sp500">sp500 · 标普500</option>
+            <option value="hsi">hsi · 恒生指数</option>
+          </select>
+        </div>
+        <button class="run" id="go">运行请求</button>
+      </div>
+      <div class="demo-out"><pre id="out"><span class="dim">// 在左侧输入参数，点击「运行请求」查看返回结果。&#10;// kline：AAPL / 0700.HK / 600519.SS / 000001.SZ&#10;// quote：获取个股名称、行业、市值、最新价等&#10;// universe：获取指数成分股代码清单</span></pre></div>
+    </div>
+  </div>
+</div></section>
+
+<section id="endpoints"><div class="wrap">
+  <div class="sec-head"><span class="idx">02</span><h2>接口一览</h2></div>
+  <div class="ep-grid">
+    <div class="ep"><div class="m">GET /kline</div><div class="d">K线数据（日K / 1m / 5m / 15m / 30m / 1h）</div><div class="ex">/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</div></div>
+    <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
+    <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
+    <div class="ep"><div class="m">GET /indices</div><div class="d">全部可用指数/清单及其成分数量</div><div class="ex">/indices</div></div>
+    <div class="ep"><div class="m">GET /symbols</div><div class="d">按区域列出股票代码（支持分页）</div><div class="ex">/symbols?region=cn&amp;limit=10</div></div>
+    <div class="ep"><div class="m">GET /status</div><div class="d">服务配置信息（区间/区域/指数）</div><div class="ex">/status</div></div>
+  </div>
+</div></section>
+
+<section id="api"><div class="wrap">
+  <div class="sec-head"><span class="idx">03</span><h2>API 文档</h2></div>
+  <div class="table-wrap">
+    <table>
+      <tr><th>参数</th><th>必填</th><th>默认</th><th>说明</th></tr>
+      <tr><td><code>symbol</code></td><td><span class="req">是</span></td><td>—</td><td>股票代码：<code>AAPL</code> / <code>0700.HK</code> / <code>600519.SS</code> / <code>000001.SZ</code></td></tr>
+      <tr><td><code>interval</code></td><td><span class="opt">否</span></td><td><code>1d</code></td><td>周期：<code>1d</code>(日线) <code>1m</code>(1分钟) <code>5m</code>(5分钟) <code>15m</code>(15分钟) <code>30m</code>(半小时) <code>1h</code>(1小时)</td></tr>
+      <tr><td><code>start</code></td><td><span class="opt">否</span></td><td>—</td><td>起始日期 <code>YYYY-MM-DD</code>（含）</td></tr>
+      <tr><td><code>end</code></td><td><span class="opt">否</span></td><td>—</td><td>结束日期 <code>YYYY-MM-DD</code>（含）</td></tr>
+      <tr><td><code>limit</code></td><td><span class="opt">否</span></td><td>全部</td><td>最多返回行数；默认返回最新 N 条</td></tr>
+      <tr><td><code>order</code></td><td><span class="opt">否</span></td><td><code>asc</code></td><td><code>asc</code> 时间升序 / <code>desc</code> 最新在前</td></tr>
+      <tr><td><code>format</code></td><td><span class="opt">否</span></td><td><code>json</code></td><td><code>json</code> / <code>csv</code>（返回原始 CSV 文本）</td></tr>
+    </table>
+  </div>
+  <p style="margin-top:14px;font-size:13px;color:var(--muted)">区域自动识别：裸代码→美股，<code>.HK</code>→港股，<code>.SS/.SZ</code>→A股，<code>.KS/.KQ</code>→韩股。也可用 <code>region</code> 参数显式指定。</p>
+</div></section>
+
+<section id="fields"><div class="wrap">
+  <div class="sec-head"><span class="idx">04</span><h2>数据字段</h2></div>
+  <div class="fields">
+    <div class="fcard">
+      <h3>日线 <span class="tag">interval=1d</span></h3>
+      <ul>
+        <li><span class="k">Date</span><span class="d">交易日期 YYYY-MM-DD</span></li>
+        <li><span class="k">Open</span><span class="d">开盘价</span></li>
+        <li><span class="k">High</span><span class="d">最高价</span></li>
+        <li><span class="k">Low</span><span class="d">最低价</span></li>
+        <li><span class="k">Close</span><span class="d">收盘价</span></li>
+        <li><span class="k">Adj Close</span><span class="d">复权收盘价（含除权除息调整）</span></li>
+        <li><span class="k">Volume</span><span class="d">成交量（股）</span></li>
+      </ul>
+    </div>
+    <div class="fcard">
+      <h3>分钟线 <span class="tag">interval=1m / 5m / 15m / 30m / 1h</span></h3>
+      <ul>
+        <li><span class="k">Datetime</span><span class="d">时间戳（精确到分钟）</span></li>
+        <li><span class="k">Open</span><span class="d">开盘价</span></li>
+        <li><span class="k">High</span><span class="d">最高价</span></li>
+        <li><span class="k">Low</span><span class="d">最低价</span></li>
+        <li><span class="k">Close</span><span class="d">收盘价</span></li>
+        <li><span class="k">Adj Close</span><span class="d">复权收盘价</span></li>
+        <li><span class="k">Volume</span><span class="d">成交量（股）</span></li>
+      </ul>
+      <p style="margin-top:12px;font-size:12px;color:var(--dim);border-top:1px dashed var(--line);padding-top:10px">5m / 15m / 30m 由采集端用 1m 数据重采样计算（Open 首 / High 最高 / Low 最低 / Close 末 / Volume 求和）。</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="examples"><div class="wrap">
+  <div class="sec-head"><span class="idx">05</span><h2>示例</h2></div>
+  <div class="codes">
+    <div class="code"><span class="cmt"># 最近 5 条日K（默认升序，limit 取最新）</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=MSFT&amp;interval=1d&amp;limit=5</span>"</div>
+    <div class="code"><span class="cmt"># 指定日期区间 + 最新在前</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=600519.SS&amp;start=2025-01-01&amp;end=2025-12-31&amp;order=desc</span>"</div>
+    <div class="code"><span class="cmt"># 港股 1 小时K线，返回 CSV</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/kline?symbol=9988.HK&amp;interval=1h&amp;limit=100&amp;format=csv</span>"</div>
+    <div class="code"><span class="cmt"># 个股信息 / 指数成分股 / 区域代码分页</span><br><span class="cmd">curl</span> "<span class="url">${API_BASE}/quote?symbol=0700.HK</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/universe?index=sp500</span>" &nbsp; <span class="cmd">curl</span> "<span class="url">${API_BASE}/symbols?region=us&amp;limit=5</span>"</div>
+  </div>
+</div></section>
+
+<footer><div class="wrap foot">
+  <span>StockAPI · 数据由 GitHub Actions 自动采集，经由 Cloudflare Workers 分发</span>
+  <span>数据来自 Yahoo Finance，仅供学习研究</span>
+</div></footer>
+
+<script>
+(function(){
+  var out=document.getElementById("out");
+  var tabs=document.querySelectorAll(".demo-tab");
+  var active="kline";
+  function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  function setTab(t){
+    active=t;
+    tabs.forEach(function(tb){ tb.classList.toggle("on", tb.getAttribute("data-t")===t); });
+    document.querySelectorAll(".demo-form .field").forEach(function(f){
+      f.style.display = f.getAttribute("data-f")===t ? "" : "none";
+    });
+  }
+  tabs.forEach(function(tb){ tb.addEventListener("click", function(){ setTab(tb.getAttribute("data-t")); }); });
+  function run(){
+    var q;
+    if(active==="quote"){
+      q="/quote?symbol="+encodeURIComponent(document.getElementById("qsym").value.trim()||"0700.HK");
+    }else if(active==="universe"){
+      q="/universe?index="+encodeURIComponent(document.getElementById("uidx").value);
+    }else{
+      var s=document.getElementById("sym").value.trim()||"AAPL";
+      var i=document.getElementById("itv").value;
+      var l=document.getElementById("lim").value||"10";
+      q="/kline?symbol="+encodeURIComponent(s)+"&interval="+i+"&limit="+l;
+    }
+    out.innerHTML="<span class=\\"dim\\">// GET "+esc(q)+"</span>\\n";
+    fetch(q).then(function(r){
+      if(!r.ok){ throw new Error("HTTP "+r.status); }
+      return r.json();
+    }).then(function(d){
+      var html="<span class=\\"ok\\">// "+esc(q)+" → "+d.count+"</span>\\n";
+      html+=JSON.stringify(d,null,2);
+      out.innerHTML=html;
+    }).catch(function(e){
+      out.innerHTML="<span class=\\"err\\">// 请求失败："+esc(e.message)+"</span>";
+    });
+  }
+  document.getElementById("go").addEventListener("click",run);
+  document.addEventListener("DOMContentLoaded",function(){ setTab("kline"); run(); });
+})();
+</script>
+</body>
+</html>`;
+
+// ============================================================
+// 入口
+// ============================================================
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    // 首页
+    if (path === "/" || path === "") {
+      return html(HOME_HTML);
+    }
+
+    const params = url.searchParams;
+
+    // 路由分发
+    switch (path) {
+      case "/kline":
+        return await handleKline(params, env);
+      case "/quote":
+        return await handleQuote(params, env);
+      case "/universe":
+        return await handleUniverse(params, env);
+      case "/indices":
+        return await handleIndices(env);
+      case "/symbols":
+        return await handleSymbols(params, env);
+      case "/status":
+        return handleStatus();
+      default:
+        return error(
+          "Not found. Use /, /kline, /quote, /universe, /indices, /symbols, /status",
+          404
+        );
+    }
+  },
+};

@@ -1,0 +1,20 @@
+name = "market-data-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# 自定义域名（需先在 Cloudflare 中把 stockapi.365200.xyz 的 DNS 指向本 Worker）
+routes = [
+  { pattern = "stockapi.365200.xyz", custom_domain = true }
+]
+
+# 免费计划：10 万请求/天
+# 部署后接口地址：https://stockapi.365200.xyz/kline
+# 首页（项目介绍 + API 文档）：https://stockapi.365200.xyz/
+
+# R2 存储绑定：数据存放在 Cloudflare R2（bucket 名与采集端 R2_BUCKET 一致）
+[[r2_buckets]]
+binding = "MARKET_DATA_R2"
+bucket_name = "tuchaung"
+
+[observability]
+enabled = true

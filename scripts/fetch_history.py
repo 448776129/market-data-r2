@@ -1,0 +1,192 @@
+"""批量历史数据拉取脚本（一次性全量入库 R2）。
+
+不再使用分散的多个 actions，一次性获取全部历史数据并写入 Cloudflare R2：
+    - 日K（近 5 年）
+    - 1分钟K（近 5 天）
+    - 1小时K（近 6 个月）
+    - 5m/15m/30m（由 1m 重采样派生）
+    - 美股 1m/5m/15m/30m/1h 均含盘前盘后延长时段
+
+数据经 Yahoo chart API + 反代（config.YAHOO_CHART_PROXY）拉取，
+gzip 压缩后并发上传 R2（scripts/r2store.py）。
+
+用法：
+    export R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_BUCKET=...
+    python scripts/fetch_history.py                 # 全部区域
+    python scripts/fetch_history.py --region us     # 仅美股
+    python scripts/fetch_history.py --region cn --batch 0 --batches 10
+
+说明：
+    - 首次部署跑一次本脚本即可获得全量历史；之后由 sync_incremental.py 定时增量。
+    - --skip-kline 可跳过 K 线只处理清单；--skip-universe 可跳过清单。
+    - 每个区域完成后会把该区域清单一并上传，供 Cloudflare Worker 读取。
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import config  # noqa: E402
+import marketlib  # noqa: E402
+import r2store  # noqa: E402
+import yahoo_chart  # noqa: E402
+
+# 写入 CSV 的列（与 yfinance 一致）
+COLS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+# 日K索引列 / 分钟K索引列
+DATE_COL = "Date"
+DT_COL = "Datetime"
+
+# 直接由雅虎拉取的分钟周期；5m/15m/30m 由 1m 派生
+SOURCE_INTERVALS = ["1m", "1h"]
+
+# 各区域目标子目录（R2 key 前缀）
+SUBDIR = {
+    "1d": config.KLINE_SUBDIR,           # kline
+    "1m": config.INTRADAY_M1_SUBDIR,     # kline_1m
+    "5m": config.INTRADAY_M5_SUBDIR,
+    "15m": config.INTRADAY_M15_SUBDIR,
+    "30m": config.INTRADAY_M30_SUBDIR,
+    "1h": config.INTRADAY_M1H_SUBDIR,
+}
+# 周期 -> yahoo_chart period 参数
+PERIOD = {
+    "1d": config.HISTORY_PERIOD,         # 5y
+    "1m": config.INTRADAY_PERIOD["1m"],  # 5d
+    "1h": config.INTRADAY_PERIOD["1h"],  # 6mo
+}
+
+
+def derive_5m_15m_30m(df_1m: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """从 1 分钟K线重采样计算 5m/15m/30m。返回 {target: df}。"""
+    out: dict[str, pd.DataFrame] = {}
+    for target, rule in config.INTRADAY_DERIVED.items():
+        agg = df_1m.resample(rule).agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+        )
+        agg = agg.dropna(subset=["Close"])
+        if agg.empty:
+            continue
+        agg["Adj Close"] = df_1m["Close"].resample(rule).last()
+        agg = agg[COLS]
+        out[target] = agg
+    return out
+
+
+def df_to_csv(df: pd.DataFrame, index_col: str) -> str:
+    """DataFrame 转 CSV 文本（索引列名 = index_col）。"""
+    d = df.copy()
+    d.index.name = index_col
+    return d.to_csv()
+
+
+def fetch_symbol(region: str, symbol: str) -> dict[str, pd.DataFrame] | None:
+    """拉取单只股票的全部周期数据，返回 {interval: df}；失败返回 None。"""
+    result: dict[str, pd.DataFrame] = {}
+    try:
+        # 日K
+        d1 = yahoo_chart.fetch_kline(symbol, interval="1d", period=PERIOD["1d"], prepost=False)
+        if not d1.empty:
+            result["1d"] = d1
+        # 分钟K
+        m1 = yahoo_chart.fetch_kline(symbol, interval="1m", period=PERIOD["1m"], prepost=True)
+        if not m1.empty:
+            result["1m"] = m1
+            for target, d in derive_5m_15m_30m(m1).items():
+                result[target] = d
+        h1 = yahoo_chart.fetch_kline(symbol, interval="1h", period=PERIOD["1h"], prepost=True)
+        if not h1.empty:
+            result["1h"] = h1
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [失败] {symbol}: {exc}", flush=True)
+        return None
+    return result or None
+
+
+def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
+    regions = [region] if region else list(config.REGIONS)
+    ok_files = 0
+    fail_symbols: list[str] = []
+
+    for reg in regions:
+        symbols = marketlib.load_symbols(reg)
+        symbols = marketlib.slice_batch(symbols, batch, batches)
+        if not symbols:
+            print(f"[警告] {reg}: 无符号（universe 缺失？）", flush=True)
+            continue
+        print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches})", flush=True)
+
+        for i, symbol in enumerate(symbols):
+            t0 = time.time()
+            data = fetch_symbol(reg, symbol)
+            if data is None:
+                fail_symbols.append(f"{reg}:{symbol}")
+                continue
+
+            # 组装待上传对象
+            items: list[tuple[str, str, bool]] = []
+            for interval, df in data.items():
+                subdir = SUBDIR[interval]
+                index_col = DATE_COL if interval == "1d" else DT_COL
+                key = f"{reg}/{subdir}/{symbol}.csv"
+                items.append((key, df_to_csv(df, index_col), True))
+
+            if items:
+                res = r2store.upload_many(items)
+                ok_files += res["ok"]
+                if res["fail"]:
+                    fail_symbols.append(f"{reg}:{symbol}")
+
+            elapsed = time.time() - t0
+            print(
+                f"  [{i+1}/{len(symbols)}] {symbol}: "
+                f"{','.join(k + '(' + str(len(v)) + ')' for k, v in data.items())} "
+                f"({elapsed:.1f}s)",
+                flush=True,
+            )
+            # 请求间隔，避免触发 Yahoo 限流
+            time.sleep(config.REQUEST_DELAY)
+
+        # 区域清单一并上传（供 Worker /universe 读取）
+        csv_text = "\n".join(symbols) + "\n"
+        r2store.put_universe(reg, csv_text)
+        print(f"[区域] {reg} 清单已上传 universe/{reg}.csv", flush=True)
+
+    # 全局状态
+    r2store.put_status(
+        {
+            "mode": "historical",
+            "completed_at": r2store.now_iso(),
+            "regions": regions,
+            "ok_files": ok_files,
+            "failed": fail_symbols[:100],
+            "fail_count": len(fail_symbols),
+        }
+    )
+
+    print(f"完成: 上传 {ok_files} 个对象, 失败 {len(fail_symbols)} 项")
+    if fail_symbols:
+        print(f"失败明细(前100): {fail_symbols}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="批量历史数据拉取（一次性全量入库 R2）")
+    parser.add_argument("--region", choices=list(config.REGIONS), help="仅处理指定区域")
+    parser.add_argument("--batch", type=int, default=0, help="当前批次（0 起）")
+    parser.add_argument("--batches", type=int, default=1, help="总批次数")
+    args = parser.parse_args()
+    return run(args.region, args.batch, args.batches)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
