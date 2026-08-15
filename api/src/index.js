@@ -10,6 +10,8 @@
  * 路由：
  *   GET /                                            → 项目介绍 + API 文档主页（HTML）
  *   GET /kline?symbol=AAPL&interval=1d&limit=5       → K线数据（日K/1m/5m/15m/30m/1h）
+ *   GET /price?symbol=AAPL                           → 实时最新价格快照
+ *   GET /download?symbol=AAPL&interval=1h            → 下载 gzip 压缩的原始 CSV
  *   GET /quote?symbol=0700.HK                        → 个股元数据（名称/行业/市值/最新价…）
  *   GET /universe?index=csi300                       → 指数成分股清单
  *   GET /indices                                     → 可用的指数/清单及其成分数量
@@ -19,8 +21,8 @@
 
 // 数据仓库信息（与 git remote 一致）
 const REPO_OWNER = "448776129";
-const REPO_NAME = "market-data-pipeline";
-const REPO_BRANCH = "master";
+const REPO_NAME = "market-data-r2";
+const REPO_BRANCH = "main";
 
 // 对外接口域名（自定义域）
 const API_BASE = "https://stockapi.365200.xyz";
@@ -326,6 +328,159 @@ async function handleQuote(params, env) {
 }
 
 // ============================================================
+// 实时价格（实时返回最新价）
+// 逻辑：从最新 K 线读取最近 1 根的价格；美股优先取 1h/1m 的最后一根（含延长时段），
+// 否则用日K最新收盘。返回实时快照。
+// ============================================================
+async function handlePrice(params, env) {
+  const symbol = (params.get("symbol") || "").trim().toUpperCase();
+  if (!symbol) {
+    return json({
+      usage: {
+        endpoint: `${API_BASE}/price`,
+        description: "实时返回股票最新价格快照",
+        params: { symbol: "股票代码（必填）" },
+        example: `${API_BASE}/price?symbol=AAPL`,
+      },
+    });
+  }
+  const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
+
+  // 优先取 1h（含延长时段，实时性最好），其次 1m，最后日K
+  const orders = ["1h", "1m", "1d"];
+  let found = null;
+  for (const interval of orders) {
+    const dir = INTERVAL_DIR[interval];
+    const text = await fetchUpstream(`data/${region}/${dir}/${symbol}.csv`, env);
+    if (text === null) continue;
+    const rows = parseCSV(text);
+    if (rows.length === 0) continue;
+    const last = rows[rows.length - 1];
+    const indexCol = interval === "1d" ? "Date" : "Datetime";
+    found = {
+      interval,
+      datetime: last[indexCol],
+      open: parseFloat(last.Open),
+      high: parseFloat(last.High),
+      low: parseFloat(last.Low),
+      close: parseFloat(last.Close),
+      volume: parseInt(last.Volume, 10),
+    };
+    break;
+  }
+
+  if (found === null) {
+    return error(`No data for ${symbol}.`, 404);
+  }
+
+  // 计算涨跌幅（相对前一根收盘）
+  const dir = INTERVAL_DIR[found.interval];
+  const text = await fetchUpstream(`data/${region}/${dir}/${symbol}.csv`, env);
+  const rows = parseCSV(text);
+  let change = null;
+  let changePercent = null;
+  if (rows.length >= 2) {
+    const prevClose = parseFloat(rows[rows.length - 2].Close);
+    if (!isNaN(prevClose) && prevClose !== 0 && !isNaN(found.close)) {
+      change = found.close - prevClose;
+      changePercent = (change / prevClose) * 100;
+    }
+  }
+
+  // 尝试获取名称 / 币种（meta 数据）
+  let name = null;
+  let currency = null;
+  const metaText = await fetchUpstream(`data/${region}/meta/${symbol}.json`, env);
+  if (metaText) {
+    try {
+      const meta = JSON.parse(metaText);
+      name = meta.name || null;
+      const info = meta.info || {};
+      currency = info.currency || null;
+      if (name === null) name = info.shortName || info.longName || null;
+    } catch {
+      // meta 解析失败则忽略
+    }
+  }
+
+  return json({
+    symbol,
+    region,
+    name,
+    price: found.close,
+    currency,
+    datetime: found.datetime,
+    interval: found.interval,
+    open: found.open,
+    high: found.high,
+    low: found.low,
+    close: found.close,
+    volume: found.volume,
+    change,
+    changePercent,
+    source: "最新K线快照",
+  });
+}
+
+// ============================================================
+// 下载原始 CSV（gzip 压缩）到本地
+// 返回 R2 中存储的原始 gzip 字节（Content-Encoding: gzip），
+// 浏览器/curl 可直接下载为 {symbol}_{interval}.csv.gz
+// ============================================================
+async function handleDownload(params, env) {
+  const symbol = (params.get("symbol") || "").trim().toUpperCase();
+  if (!symbol) {
+    return json({
+      usage: {
+        endpoint: `${API_BASE}/download`,
+        description: "下载股票K线数据的 gzip 压缩 CSV（原始文件，体积小）",
+        params: {
+          symbol: "股票代码（必填），如 AAPL / 0700.HK / 600519.SS",
+          interval: `周期，默认 1d。可选：${Object.keys(INTERVAL_DIR).join(" / ")}`,
+        },
+        example: `${API_BASE}/download?symbol=AAPL&interval=1h`,
+        note: "返回 gzip 压缩的 .csv.gz 文件；浏览器下载后可用 WinRAR/7-Zip 解压，或直接用 data 接口获取解压后的文本。",
+      },
+    });
+  }
+  const interval = (params.get("interval") || "1d").toLowerCase();
+  if (!INTERVAL_DIR[interval]) {
+    return error(`Invalid interval: ${interval}. Allowed: ${Object.keys(INTERVAL_DIR).join(", ")}`);
+  }
+  const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
+  const dir = INTERVAL_DIR[interval];
+  const r2key = `${region}/${dir}/${symbol}.csv`;
+
+  // 直接从 R2 取原始字节（不解压）
+  let obj;
+  try {
+    obj = await env.MARKET_DATA_R2.get(r2key);
+  } catch {
+    obj = null;
+  }
+  if (!obj) {
+    return error(`No data for ${symbol} (${interval}).`, 404);
+  }
+  const bytes = await obj.arrayBuffer();
+
+  // 文件名：{symbol}_{interval}.csv.gz
+  const filename = `${symbol}_${interval}.csv.gz`;
+  const headers = {
+    "Content-Type": "application/gzip",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+    ...corsHeaders(),
+  };
+  // 只有确实是 gzip 才加 Content-Encoding，否则是纯文本直接给 .csv
+  const data = new Uint8Array(bytes);
+  const isGzip = data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
+  if (!isGzip) {
+    headers["Content-Type"] = "text/csv; charset=utf-8";
+    headers["Content-Disposition"] = `attachment; filename="${symbol}_${interval}.csv"`;
+  }
+  return new Response(bytes, { status: 200, headers });
+}
+
+// ============================================================
 // 指数成分股 / 清单
 // ============================================================
 async function handleUniverse(params, env) {
@@ -419,13 +574,17 @@ async function handleSymbols(params, env) {
 // ============================================================
 // 状态
 // ============================================================
-function handleStatus() {
+function handleStatus(request) {
+  const currentBase = request ? `https://${request.url ? new URL(request.url).host : API_BASE}` : API_BASE;
   return json({
     service: "StockAPI",
     base: API_BASE,
+    current: currentBase,
     repo: `${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}`,
     endpoints: {
       kline: `${API_BASE}/kline`,
+      price: `${API_BASE}/price`,
+      download: `${API_BASE}/download`,
       quote: `${API_BASE}/quote`,
       universe: `${API_BASE}/universe`,
       indices: `${API_BASE}/indices`,
@@ -627,6 +786,8 @@ const HOME_HTML = `<!DOCTYPE html>
   <div class="sec-head"><span class="idx">02</span><h2>接口一览</h2></div>
   <div class="ep-grid">
     <div class="ep"><div class="m">GET /kline</div><div class="d">K线数据（日K / 1m / 5m / 15m / 30m / 1h）</div><div class="ex">/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</div></div>
+    <div class="ep"><div class="m">GET /price</div><div class="d">实时最新价格快照（最新K线 + 涨跌幅）</div><div class="ex">/price?symbol=AAPL</div></div>
+    <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（体积小，可离线分析）</div><div class="ex">/download?symbol=AAPL&amp;interval=1h</div></div>
     <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
     <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
     <div class="ep"><div class="m">GET /indices</div><div class="d">全部可用指数/清单及其成分数量</div><div class="ex">/indices</div></div>
@@ -650,6 +811,11 @@ const HOME_HTML = `<!DOCTYPE html>
     </table>
   </div>
   <p style="margin-top:14px;font-size:13px;color:var(--muted)">区域自动识别：裸代码→美股，<code>.HK</code>→港股，<code>.SS/.SZ</code>→A股，<code>.KS/.KQ</code>→韩股。也可用 <code>region</code> 参数显式指定。</p>
+
+  <div class="ep-grid" style="margin-top:26px">
+    <div class="ep"><div class="m">GET /price</div><div class="d">实时最新价格快照：从最新K线读取，返回价格、涨跌幅、最高最低、成交量。</div><div class="ex">/price?symbol=AAPL</div></div>
+    <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（保存为 .csv.gz，体积小，适合离线分析）。</div><div class="ex">/download?symbol=600519.SS&amp;interval=1d</div></div>
+  </div>
 </div></section>
 
 <section id="fields"><div class="wrap">
@@ -768,6 +934,10 @@ export default {
         return await handleKline(params, env);
       case "/quote":
         return await handleQuote(params, env);
+      case "/price":
+        return await handlePrice(params, env);
+      case "/download":
+        return await handleDownload(params, env);
       case "/universe":
         return await handleUniverse(params, env);
       case "/indices":
@@ -775,10 +945,10 @@ export default {
       case "/symbols":
         return await handleSymbols(params, env);
       case "/status":
-        return handleStatus();
+        return handleStatus(request);
       default:
         return error(
-          "Not found. Use /, /kline, /quote, /universe, /indices, /symbols, /status",
+          "Not found. Use /, /kline, /price, /download, /quote, /universe, /indices, /symbols, /status",
           404
         );
     }
