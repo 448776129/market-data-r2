@@ -14,7 +14,7 @@ routes = [
 # R2 存储绑定：数据存放在 Cloudflare R2（bucket 名与采集端 R2_BUCKET 一致）
 [[r2_buckets]]
 binding = "MARKET_DATA_R2"
-bucket_name = "tuchaung"
+bucket_name = "stocksmarkets"
 
 [observability]
 enabled = true

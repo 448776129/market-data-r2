@@ -86,7 +86,7 @@ Cloudflare Worker（stockapi.365200.xyz）
 | `R2_ACCOUNT_ID` | Cloudflare 账户 ID（如 `8e43ef...`） |
 | `R2_ACCESS_KEY_ID` | R2 S3 API Access Key ID |
 | `R2_SECRET_ACCESS_KEY` | R2 S3 API Secret Access Key |
-| `R2_BUCKET` | R2 bucket 名（如 `tuchaung`） |
+| `R2_BUCKET` | R2 bucket 名（如 `stocksmarkets`） |
 
 ### 2. 首次全量入库
 
@@ -106,7 +106,7 @@ Cloudflare Worker（stockapi.365200.xyz）
 pip install -r requirements.txt
 
 # 配置 R2 凭据（Windows 可用 $env:，Linux 用 export）
-export R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_BUCKET=tuchaung
+export R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_BUCKET=stocksmarkets
 
 # 全量历史入库 R2（--region 可选；--batch/--batches 分批）
 python scripts/fetch_history.py --region us
