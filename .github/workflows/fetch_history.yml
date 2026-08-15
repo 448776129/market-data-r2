@@ -23,6 +23,11 @@ on:
 env:
   PYTHON_VERSION: "3.11"
 
+# 防止重复手动触发并行运行（全量入库写同一批 key）
+concurrency:
+  group: fetch-history
+  cancel-in-progress: true
+
 jobs:
   # ============ A股（4595 只，分 10 批） ============
   history-cn:
@@ -111,3 +116,22 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: python scripts/fetch_history.py --region kr
+
+  # ============ 失败告警（任一 history job 失败时通知） ============
+  notify-failure:
+    name: Alert · 全量入库失败
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    needs: [history-cn, history-us, history-hk, history-kr]
+    steps:
+      - name: Send failure alert
+        env:
+          WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "未配置 ALERT_WEBHOOK_URL，跳过告警（如需通知请在仓库 Secrets 中添加）"
+            exit 0
+          fi
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"⚠️ 股票数据全量入库失败\n仓库: '"${{ github.repository }}"'\n运行: '"${{ github.server_url }}"'/'"${{ github.repository }}"'/actions/runs/'"${{ github.run_id }}"'\n触发: '"${{ github.event_name }}"'"}'

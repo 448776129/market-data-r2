@@ -27,6 +27,11 @@ const REPO_BRANCH = "main";
 // 对外接口域名（自定义域）
 const API_BASE = "https://stockapi.365200.xyz";
 
+// Yahoo chart API 反代入口（与采集端 config.YAHOO_CHART_PROXY 一致）
+// 国内访问 Yahoo 需经反代转发；用于 /price 实时行情。
+const YAHOO_CHART_PROXY = "https://img2.365200.xyz";
+const YAHOO_CHART_ORIGIN = "https://query1.finance.yahoo.com/v8/finance/chart/";
+
 // interval -> data 子目录映射
 const INTERVAL_DIR = {
   "1d": "kline",
@@ -329,95 +334,100 @@ async function handleQuote(params, env) {
 }
 
 // ============================================================
-// 实时价格（实时返回最新价）
-// 逻辑：从最新 K 线读取最近 1 根的价格；美股优先取 1h/1m 的最后一根（含延长时段），
-// 否则用日K最新收盘。返回实时快照。
+// 实时价格（当场调取 Yahoo API，实时返回最新价）
+// 逻辑：直接请求 Yahoo chart API（经反代）range=1d 数据，
+// 从 meta 取实时价格 / 涨跌 / 当日高低 / 成交量 / 名称 / 币种。
+// 注意：不读 R2 数据库，保证价格是最新的（含盘前盘后）。
 // ============================================================
+async function fetchRealtimeQuote(symbol) {
+  // 经反代访问 Yahoo chart API（range=1d 足够拿 meta 实时价）
+  const query = `interval=1d&range=1d`;
+  const url = `${YAHOO_CHART_PROXY}/${YAHOO_CHART_ORIGIN}${encodeURIComponent(symbol)}?${query}`;
+  const resp = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`Yahoo chart API HTTP ${resp.status}`);
+  const data = await resp.json();
+  const result = (data && data.chart && data.chart.result) || [];
+  if (result.length === 0) return null;
+  return result[0];
+}
+
 async function handlePrice(params, env) {
   const symbol = (params.get("symbol") || "").trim().toUpperCase();
   if (!symbol) {
     return json({
       usage: {
         endpoint: `${API_BASE}/price`,
-        description: "实时返回股票最新价格快照",
-        params: { symbol: "股票代码（必填）" },
+        description: "实时返回股票最新价格（当场调取 Yahoo API，非数据库缓存）",
+        params: { symbol: "股票代码（必填），如 AAPL / 0700.HK / 600519.SS" },
         example: `${API_BASE}/price?symbol=AAPL`,
       },
     });
   }
   const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
 
-  // 优先取 1h（含延长时段，实时性最好），其次 1m，最后日K
-  const orders = ["1h", "1m", "1d"];
-  let found = null;
-  for (const interval of orders) {
-    const dir = INTERVAL_DIR[interval];
-    const text = await fetchUpstream(`data/${region}/${dir}/${symbol}.csv`, env);
-    if (text === null) continue;
-    const rows = parseCSV(text);
-    if (rows.length === 0) continue;
-    const last = rows[rows.length - 1];
-    const indexCol = interval === "1d" ? "Date" : "Datetime";
-    found = {
-      interval,
-      datetime: last[indexCol],
-      open: parseFloat(last.Open),
-      high: parseFloat(last.High),
-      low: parseFloat(last.Low),
-      close: parseFloat(last.Close),
-      volume: parseInt(last.Volume, 10),
-    };
-    break;
+  // 当场调取 Yahoo 实时行情
+  let res;
+  try {
+    res = await fetchRealtimeQuote(symbol);
+  } catch (e) {
+    return error(`实时行情获取失败: ${e.message}`, 502);
+  }
+  if (res === null) {
+    return error(`Yahoo 无此股票数据: ${symbol}`, 404);
   }
 
-  if (found === null) {
-    return error(`No data for ${symbol}.`, 404);
-  }
+  const meta = res.meta || {};
+  const ts = res.timestamp || [];
+  const quote = ((res.indicators || {}).quote || [{}])[0] || {};
+  const closeArr = quote.close || [];
+  const openArr = quote.open || [];
+  const highArr = quote.high || [];
+  const lowArr = quote.low || [];
+  const volArr = quote.volume || [];
 
-  // 计算涨跌幅（相对前一根收盘）
-  const dir = INTERVAL_DIR[found.interval];
-  const text = await fetchUpstream(`data/${region}/${dir}/${symbol}.csv`, env);
-  const rows = parseCSV(text);
+  // 最新一根 bar
+  const n = ts.length;
+  const lastIdx = n > 0 ? n - 1 : -1;
+  const price = meta.regularMarketPrice !== undefined ? meta.regularMarketPrice : (lastIdx >= 0 ? closeArr[lastIdx] : null);
+  const open = lastIdx >= 0 ? openArr[lastIdx] : null;
+  const high = lastIdx >= 0 ? highArr[lastIdx] : null;
+  const low = lastIdx >= 0 ? lowArr[lastIdx] : null;
+  const volume = lastIdx >= 0 ? volArr[lastIdx] : 0;
+  const datetime = lastIdx >= 0 ? new Date(ts[lastIdx] * 1000).toISOString().slice(0, 19).replace("T", " ") : null;
+
+  // 涨跌（meta 提供 regularMarketPrice / chartPreviousClose）
+  const prevClose = meta.chartPreviousClose !== undefined ? meta.chartPreviousClose : (n >= 2 ? closeArr[n - 2] : null);
   let change = null;
   let changePercent = null;
-  if (rows.length >= 2) {
-    const prevClose = parseFloat(rows[rows.length - 2].Close);
-    if (!isNaN(prevClose) && prevClose !== 0 && !isNaN(found.close)) {
-      change = found.close - prevClose;
-      changePercent = (change / prevClose) * 100;
-    }
+  if (price !== null && price !== undefined && prevClose !== null && prevClose !== undefined && prevClose !== 0) {
+    change = +(price - prevClose).toFixed(4);
+    changePercent = +((change / prevClose) * 100).toFixed(4);
   }
 
-  // 尝试获取名称 / 币种（meta 数据，扁平结构）
-  let name = null;
-  let currency = null;
-  const metaText = await fetchUpstream(`data/${region}/meta/${symbol}.json`, env);
-  if (metaText) {
-    try {
-      const meta = JSON.parse(metaText);
-      name = meta.longName || meta.shortName || meta.name || null;
-      currency = meta.currency || null;
-    } catch {
-      // meta 解析失败则忽略
-    }
-  }
+  // 名称 / 币种（当场从 meta 获取，无需数据库）
+  const name = meta.longName || meta.shortName || null;
+  const currency = meta.currency || null;
 
   return json({
     symbol,
     region,
     name,
-    price: found.close,
+    price,
     currency,
-    datetime: found.datetime,
-    interval: found.interval,
-    open: found.open,
-    high: found.high,
-    low: found.low,
-    close: found.close,
-    volume: found.volume,
+    datetime,
+    interval: "realtime",
+    open,
+    high,
+    low,
+    close: price,
+    volume,
     change,
     changePercent,
-    source: "最新K线快照",
+    fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh ?? null,
+    fiftyTwoWeekLow: meta.fiftyTwoWeekLow ?? null,
+    marketTime: meta.regularMarketTime ? new Date(meta.regularMarketTime * 1000).toISOString() : null,
+    source: "Yahoo 实时行情（当场调取）",
   });
 }
 
@@ -796,7 +806,7 @@ const HOME_HTML = `<!DOCTYPE html>
   <div class="sec-head"><span class="idx">02</span><h2>接口一览</h2></div>
   <div class="ep-grid">
     <div class="ep"><div class="m">GET /kline</div><div class="d">K线数据（日K / 1m / 5m / 15m / 30m / 1h）</div><div class="ex">/kline?symbol=AAPL&amp;interval=1d&amp;limit=5</div></div>
-    <div class="ep"><div class="m">GET /price</div><div class="d">实时最新价格快照（最新K线 + 涨跌幅）</div><div class="ex">/price?symbol=AAPL</div></div>
+    <div class="ep"><div class="m">GET /price</div><div class="d">实时价格（当场调取 Yahoo API，含涨跌幅/52周高低，非数据库缓存）</div><div class="ex">/price?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（体积小，可离线分析）</div><div class="ex">/download?symbol=AAPL&amp;interval=1h</div></div>
     <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
     <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
@@ -874,7 +884,10 @@ const HOME_HTML = `<!DOCTYPE html>
         <tr><td><code>volume</code></td><td>number</td><td>最新bar成交量</td><td><code>123456</code></td><td>是（延长时段 0）</td></tr>
         <tr><td><code>change</code></td><td>number</td><td>涨跌额（相对前收盘）</td><td><code>-7.56</code></td><td>是（数据不足）</td></tr>
         <tr><td><code>changePercent</code></td><td>number</td><td>涨跌幅（%）</td><td><code>-2.41</code></td><td>是（数据不足）</td></tr>
-        <tr><td><code>source</code></td><td>string</td><td>数据来源说明</td><td><code>"最新K线快照"</code></td><td>否</td></tr>
+        <tr><td><code>source</code></td><td>string</td><td>数据来源说明</td><td><code>"Yahoo 实时行情（当场调取）"</code></td><td>否</td></tr>
+        <tr><td><code>fiftyTwoWeekHigh</code></td><td>number</td><td>52周最高价（实时）</td><td><code>344.57</code></td><td>是</td></tr>
+        <tr><td><code>fiftyTwoWeekLow</code></td><td>number</td><td>52周最低价（实时）</td><td><code>223.78</code></td><td>是</td></tr>
+        <tr><td><code>marketTime</code></td><td>string</td><td>最新行情时间（ISO）</td><td><code>"2026-08-14T20:00:01Z"</code></td><td>是</td></tr>
       </tbody>
     </table>
   </div>
