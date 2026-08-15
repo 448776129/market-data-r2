@@ -199,6 +199,22 @@ async function fetchUpstream(path, env) {
   return await resp.text();
 }
 
+// 带区域回退的数据读取：
+// 中国 A股(.SS/.SZ) 与 中国 ETF(.SS/.SZ) 后缀相同，inferRegion 会识别为 cn。
+// 若在 cn 下找不到数据，回退尝试 cn_etf（中国 ETF 独立分类）。
+// 返回文本；都找不到返回 null。
+async function fetchWithFallback(path, env, fallbackRegion = "cn_etf") {
+  let text = await fetchUpstream(path, env);
+  if (text !== null) return text;
+  // 回退：把 /cn/ 换成 /cn_etf/
+  const alt = path.replace("/cn/", `/${fallbackRegion}/`);
+  if (alt !== path) {
+    text = await fetchUpstream(alt, env);
+    if (text !== null) return text;
+  }
+  return null;
+}
+
 // 数值/日期过滤预备：返回比较用的时间戳
 function tsOf(value) {
   if (value === undefined || value === null || value === "") return null;
@@ -242,7 +258,7 @@ async function handleKline(params, env) {
   const endTs = tsOf(params.get("end"));
 
   const dir = INTERVAL_DIR[interval];
-  const text = await fetchUpstream(`data/${region}/${dir}/${symbol}.csv`, env);
+  const text = await fetchWithFallback(`data/${region}/${dir}/${symbol}.csv`, env);
   if (text === null) {
     return error(
       `No data for ${symbol} (${interval}). File not found: data/${region}/${dir}/${symbol}.csv`,
@@ -299,7 +315,7 @@ async function handleQuote(params, env) {
   }
 
   const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
-  const text = await fetchUpstream(`data/${region}/meta/${symbol}.json`, env);
+  const text = await fetchWithFallback(`data/${region}/meta/${symbol}.json`, env);
   if (text === null) {
     return error(`No meta for ${symbol}. File not found: data/${region}/meta/${symbol}.json`, 404);
   }
@@ -462,14 +478,20 @@ async function handleDownload(params, env) {
   }
   const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
   const dir = INTERVAL_DIR[interval];
-  const r2key = `${region}/${dir}/${symbol}.csv`;
+  const r2keys = [`${region}/${dir}/${symbol}.csv`];
+  // 中国 A股(.SS/.SZ) 回退到 cn_etf
+  if (region === "cn") r2keys.push(`cn_etf/${dir}/${symbol}.csv`);
 
   // 直接从 R2 取原始字节（不解压）
-  let obj;
-  try {
-    obj = await env.MARKET_DATA_R2.get(r2key);
-  } catch {
-    obj = null;
+  let obj = null;
+  let r2key = null;
+  for (const k of r2keys) {
+    try {
+      obj = await env.MARKET_DATA_R2.get(k);
+      if (obj) { r2key = k; break; }
+    } catch {
+      obj = null;
+    }
   }
   if (!obj) {
     return error(`No data for ${symbol} (${interval}).`, 404);
