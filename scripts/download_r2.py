@@ -69,12 +69,13 @@ def download(key: str, out: Path) -> int:
         return 0
     # 自动解压 gzip
     if raw[:2] == b"\x1f\x8b":
-        text = gzip.decompress(raw).decode("utf-8")
+        text = gzip.decompress(raw).decode("utf-8-sig")  # 兼容带/不带 BOM
     else:
-        text = raw.decode("utf-8")
+        text = raw.decode("utf-8-sig")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text, encoding="utf-8")
-    return len(text.encode("utf-8"))
+    # utf-8-sig 编码写入：确保本地文件带 UTF-8 BOM，Excel 可直接打开
+    out.write_text(text, encoding="utf-8-sig")
+    return len(text.encode("utf-8-sig"))
 
 
 def main() -> int:

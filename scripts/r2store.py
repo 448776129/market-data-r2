@@ -81,8 +81,14 @@ def put_bytes(key: str, data: bytes, content_type: str = "text/csv; charset=utf-
 
 
 def put_csv(key: str, csv_text: str):
-    """将 CSV 文本压缩后写入 R2。"""
-    put_bytes(key, _gzip_bytes(csv_text.encode("utf-8")), compressed=True)
+    """将 CSV 文本（UTF-8 带 BOM）压缩后写入 R2。
+
+    UTF-8 BOM 使 Windows Excel 双击即可正确识别编码，避免乱码。
+    """
+    content = csv_text
+    if not content.startswith("\ufeff"):
+        content = "\ufeff" + content
+    put_bytes(key, _gzip_bytes(content.encode("utf-8")), compressed=True)
 
 
 def put_universe(region: str, csv_text: str):
