@@ -49,6 +49,7 @@ const REGION_LABEL = {
   hk: "港股",
   kr: "韩股",
   etf: "美股ETF",
+  cn_etf: "中国ETF",
 };
 
 // 指数/清单 -> 中文名（universe/*.csv 文件名）
@@ -63,6 +64,7 @@ const INDEX_LABEL = {
   hk: "港股全部",
   kr: "韩股全部",
   etf: "美股ETF",
+  cn_etf: "中国ETF",
 };
 
 // 从代码后缀推断区域；裸代码默认美股
