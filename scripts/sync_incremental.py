@@ -244,14 +244,18 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
             "mode": "incremental",
             "completed_at": r2store.now_iso(),
             "regions": regions,
-            "regions_minute": regions_minute,
+            "regions_minute": list(active_regions),
             "added": total_added,
             "failed": failed[:100],
             "fail_count": len(failed),
         }
     )
     print(f"增量完成: 新增 {total_added} 行, 失败 {len(failed)} 项")
-    return 1 if failed else 0
+    # 单只股票失败不视为整体失败（避免 job 失败导致其余批次被取消），
+    # 失败明细已写入 _status.json 供后续重试。
+    if failed:
+        print(f"警告: {len(failed)} 只股票失败(不中断): {failed[:30]}", flush=True)
+    return 0
 
 
 def main() -> int:
