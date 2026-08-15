@@ -302,7 +302,8 @@ async function handleQuote(params, env) {
     return error(`Invalid meta JSON for ${symbol}`, 502);
   }
 
-  const info = meta.info || {};
+  // 兼容两种结构：扁平（chart meta）与嵌套（旧 yfinance info）
+  const info = meta.info || meta;
   const pick = [
     "longName", "shortName", "sector", "industry", "country", "exchange",
     "currency", "marketCap", "currentPrice", "open", "previousClose",
@@ -317,11 +318,11 @@ async function handleQuote(params, env) {
   }
 
   return json({
-    symbol: meta.symbol,
-    region: meta.region,
-    name: meta.name,
+    symbol: meta.symbol || symbol,
+    region: meta.region || region,
+    name: meta.longName || meta.shortName || meta.name,
     currency: meta.currency,
-    exchange: meta.exchange,
+    exchange: meta.exchange || meta.fullExchangeName || info.exchange,
     isin: meta.isin || null,
     quote,
   });
@@ -387,17 +388,15 @@ async function handlePrice(params, env) {
     }
   }
 
-  // 尝试获取名称 / 币种（meta 数据）
+  // 尝试获取名称 / 币种（meta 数据，扁平结构）
   let name = null;
   let currency = null;
   const metaText = await fetchUpstream(`data/${region}/meta/${symbol}.json`, env);
   if (metaText) {
     try {
       const meta = JSON.parse(metaText);
-      name = meta.name || null;
-      const info = meta.info || {};
-      currency = info.currency || null;
-      if (name === null) name = info.shortName || info.longName || null;
+      name = meta.longName || meta.shortName || meta.name || null;
+      currency = meta.currency || null;
     } catch {
       // meta 解析失败则忽略
     }
@@ -702,6 +701,17 @@ const HOME_HTML = `<!DOCTYPE html>
   .fcard .k{font-family:var(--mono);color:var(--accent2);min-width:96px}
   .fcard .d{color:var(--muted)}
 
+  /* 详细字段说明表 */
+  .fsub{font-size:16px;font-weight:700;margin:30px 0 12px;font-family:var(--mono)}
+  .fsub .tag{font-size:11px;color:var(--dim);font-weight:400;font-family:var(--mono)}
+  .ftable{overflow-x:auto;border:1px solid var(--line);border-radius:12px;margin-bottom:8px}
+  .ftable table{width:100%;border-collapse:collapse;font-size:13px;min-width:640px}
+  .ftable th,.ftable td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  .ftable th{background:var(--panel);font-family:var(--mono);font-weight:600;color:var(--muted);font-size:12px}
+  .ftable tr:last-child td{border-bottom:none}
+  .ftable td code{font-family:var(--mono);color:var(--accent2);font-size:12px}
+  .ftable .dim-row{color:var(--dim);font-size:12px}
+
   footer{padding:40px 0 56px;border-top:1px solid var(--line);color:var(--dim);font-size:13px}
   .foot{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center}
 
@@ -819,33 +829,116 @@ const HOME_HTML = `<!DOCTYPE html>
 </div></section>
 
 <section id="fields"><div class="wrap">
-  <div class="sec-head"><span class="idx">04</span><h2>数据字段</h2></div>
-  <div class="fields">
-    <div class="fcard">
-      <h3>日线 <span class="tag">interval=1d</span></h3>
-      <ul>
-        <li><span class="k">Date</span><span class="d">交易日期 YYYY-MM-DD</span></li>
-        <li><span class="k">Open</span><span class="d">开盘价</span></li>
-        <li><span class="k">High</span><span class="d">最高价</span></li>
-        <li><span class="k">Low</span><span class="d">最低价</span></li>
-        <li><span class="k">Close</span><span class="d">收盘价</span></li>
-        <li><span class="k">Adj Close</span><span class="d">复权收盘价（含除权除息调整）</span></li>
-        <li><span class="k">Volume</span><span class="d">成交量（股）</span></li>
-      </ul>
-    </div>
-    <div class="fcard">
-      <h3>分钟线 <span class="tag">interval=1m / 5m / 15m / 30m / 1h</span></h3>
-      <ul>
-        <li><span class="k">Datetime</span><span class="d">时间戳（精确到分钟）</span></li>
-        <li><span class="k">Open</span><span class="d">开盘价</span></li>
-        <li><span class="k">High</span><span class="d">最高价</span></li>
-        <li><span class="k">Low</span><span class="d">最低价</span></li>
-        <li><span class="k">Close</span><span class="d">收盘价</span></li>
-        <li><span class="k">Adj Close</span><span class="d">复权收盘价</span></li>
-        <li><span class="k">Volume</span><span class="d">成交量（股）</span></li>
-      </ul>
-      <p style="margin-top:12px;font-size:12px;color:var(--dim);border-top:1px dashed var(--line);padding-top:10px">5m / 15m / 30m 由采集端用 1m 数据重采样计算（Open 首 / High 最高 / Low 最低 / Close 末 / Volume 求和）。</p>
-    </div>
+  <div class="sec-head"><span class="idx">04</span><h2>字段说明</h2></div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px">以下为各接口返回字段的完整说明：名称、类型、描述、示例值、是否可为空（<code>null</code> / 缺失）。</p>
+
+  <h3 class="fsub">一、K线数据 <span class="tag">GET /kline</span></h3>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>symbol</code></td><td>string</td><td>股票代码</td><td><code>"AAPL"</code></td><td>否</td></tr>
+        <tr><td><code>region</code></td><td>string</td><td>市场区域</td><td><code>"us"</code></td><td>否</td></tr>
+        <tr><td><code>interval</code></td><td>string</td><td>K线周期</td><td><code>"1d"</code></td><td>否</td></tr>
+        <tr><td><code>count</code></td><td>number</td><td>返回条数</td><td><code>5</code></td><td>否</td></tr>
+        <tr><td><code>order</code></td><td>string</td><td>排序方向</td><td><code>"asc"</code></td><td>否</td></tr>
+        <tr><td><code>data[]</code></td><td>array</td><td>K线数组</td><td><code>[...]</code></td><td>否（空则 <code>[]</code>）</td></tr>
+        <tr><td><code>data[].Date</code></td><td>string</td><td>交易日期（日线）</td><td><code>"2026-08-14"</code></td><td>否</td></tr>
+        <tr><td><code>data[].Datetime</code></td><td>string</td><td>时间戳（分钟线，UTC）</td><td><code>"2026-08-14 23:59:59"</code></td><td>否</td></tr>
+        <tr><td><code>data[].Open</code></td><td>number</td><td>开盘价</td><td><code>305.10</code></td><td>否</td></tr>
+        <tr><td><code>data[].High</code></td><td>number</td><td>最高价</td><td><code>305.66</code></td><td>否</td></tr>
+        <tr><td><code>data[].Low</code></td><td>number</td><td>最低价</td><td><code>300.57</code></td><td>否</td></tr>
+        <tr><td><code>data[].Close</code></td><td>number</td><td>收盘价</td><td><code>302.25</code></td><td>否</td></tr>
+        <tr><td><code>data[].Adj Close</code></td><td>number</td><td>复权收盘价（延长时段 bar 可能缺失）</td><td><code>302.25</code></td><td>是（延长时段为 null）</td></tr>
+        <tr><td><code>data[].Volume</code></td><td>number</td><td>成交量（股，延长时段为 0）</td><td><code>41657800</code></td><td>是（延长时段为 0）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="fsub">二、实时价格 <span class="tag">GET /price</span></h3>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>symbol</code></td><td>string</td><td>股票代码</td><td><code>"AAPL"</code></td><td>否</td></tr>
+        <tr><td><code>region</code></td><td>string</td><td>市场区域</td><td><code>"us"</code></td><td>否</td></tr>
+        <tr><td><code>name</code></td><td>string</td><td>公司名称</td><td><code>"Apple Inc."</code></td><td>是（meta 缺失）</td></tr>
+        <tr><td><code>price</code></td><td>number</td><td>最新价</td><td><code>305.77</code></td><td>否</td></tr>
+        <tr><td><code>currency</code></td><td>string</td><td>计价货币</td><td><code>"USD"</code></td><td>是（meta 缺失）</td></tr>
+        <tr><td><code>datetime</code></td><td>string</td><td>最新bar时间</td><td><code>"2026-08-14 19:00:00"</code></td><td>否</td></tr>
+        <tr><td><code>interval</code></td><td>string</td><td>价格来源周期（1h/1m/1d）</td><td><code>"1h"</code></td><td>否</td></tr>
+        <tr><td><code>open</code></td><td>number</td><td>当日/区间开盘</td><td><code>305.10</code></td><td>否</td></tr>
+        <tr><td><code>high</code></td><td>number</td><td>当日/区间最高</td><td><code>305.66</code></td><td>否</td></tr>
+        <tr><td><code>low</code></td><td>number</td><td>当日/区间最低</td><td><code>300.57</code></td><td>否</td></tr>
+        <tr><td><code>close</code></td><td>number</td><td>最新收盘</td><td><code>305.77</code></td><td>否</td></tr>
+        <tr><td><code>volume</code></td><td>number</td><td>最新bar成交量</td><td><code>123456</code></td><td>是（延长时段 0）</td></tr>
+        <tr><td><code>change</code></td><td>number</td><td>涨跌额（相对前收盘）</td><td><code>-7.56</code></td><td>是（数据不足）</td></tr>
+        <tr><td><code>changePercent</code></td><td>number</td><td>涨跌幅（%）</td><td><code>-2.41</code></td><td>是（数据不足）</td></tr>
+        <tr><td><code>source</code></td><td>string</td><td>数据来源说明</td><td><code>"最新K线快照"</code></td><td>否</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="fsub">三、个股元数据 <span class="tag">GET /quote</span></h3>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>symbol</code></td><td>string</td><td>股票代码</td><td><code>"AAPL"</code></td><td>否</td></tr>
+        <tr><td><code>region</code></td><td>string</td><td>市场区域</td><td><code>"us"</code></td><td>否</td></tr>
+        <tr><td><code>name</code></td><td>string</td><td>公司名称</td><td><code>"Apple Inc."</code></td><td>是</td></tr>
+        <tr><td><code>currency</code></td><td>string</td><td>计价货币</td><td><code>"USD"</code></td><td>是</td></tr>
+        <tr><td><code>exchange</code></td><td>string</td><td>交易所名称</td><td><code>"NasdaqGS"</code></td><td>是</td></tr>
+        <tr><td><code>isin</code></td><td>string</td><td>ISIN 代码</td><td><code>"US0378331005"</code></td><td>是</td></tr>
+        <tr><td><code>quote.longName</code></td><td>string</td><td>公司全称</td><td><code>"Apple Inc."</code></td><td>是</td></tr>
+        <tr><td><code>quote.fiftyTwoWeekHigh</code></td><td>number</td><td>52周最高价</td><td><code>344.57</code></td><td>是</td></tr>
+        <tr><td><code>quote.fiftyTwoWeekLow</code></td><td>number</td><td>52周最低价</td><td><code>223.78</code></td><td>是</td></tr>
+        <tr><td><code>quote.regularMarketPrice</code></td><td>number</td><td>最新价</td><td><code>305.93</code></td><td>是</td></tr>
+        <tr><td><code>quote.sector</code></td><td>string</td><td>所属行业板块</td><td><code>"Technology"</code></td><td>是</td></tr>
+        <tr><td><code>quote.marketCap</code></td><td>number</td><td>总市值（元）</td><td><code>4.65e12</code></td><td>是</td></tr>
+        <tr><td><code>quote.trailingPE</code></td><td>number</td><td>市盈率（TTM）</td><td><code>35.2</code></td><td>是</td></tr>
+        <tr><td><code>quote.dividendYield</code></td><td>number</td><td>股息率（小数）</td><td><code>0.004</code></td><td>是</td></tr>
+        <tr><td><code>quote.totalRevenue</code></td><td>number</td><td>总营收（元）</td><td><code>3.9e11</code></td><td>是</td></tr>
+        <tr><td><code>quote.freeCashflow</code></td><td>number</td><td>自由现金流（元）</td><td><code>1.1e11</code></td><td>是</td></tr>
+        <tr><td colspan="2" class="dim-row">其余 <code>quote.*</code> 字段</td><td>见下方「quote 子字段」清单</td><td colspan="2"></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="fsub">quote 子字段清单 <span class="tag">GET /quote 返回的 quote 对象</span></h3>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>longName / shortName</code></td><td>string</td><td>公司全称 / 简称</td><td>是</td></tr>
+        <tr><td><code>sector / industry</code></td><td>string</td><td>板块 / 行业</td><td>是</td></tr>
+        <tr><td><code>country / exchange</code></td><td>string</td><td>国家 / 交易所</td><td>是</td></tr>
+        <tr><td><code>currency</code></td><td>string</td><td>计价货币</td><td>是</td></tr>
+        <tr><td><code>marketCap</code></td><td>number</td><td>总市值</td><td>是</td></tr>
+        <tr><td><code>currentPrice / regularMarketPrice</code></td><td>number</td><td>最新价</td><td>是</td></tr>
+        <tr><td><code>open / previousClose</code></td><td>number</td><td>今开 / 昨收</td><td>是</td></tr>
+        <tr><td><code>dayHigh / dayLow</code></td><td>number</td><td>当日高低</td><td>是</td></tr>
+        <tr><td><code>fiftyTwoWeekHigh / Low</code></td><td>number</td><td>52周高低</td><td>是</td></tr>
+        <tr><td><code>trailingPE / forwardPE</code></td><td>number</td><td>TTM / 前瞻市盈率</td><td>是</td></tr>
+        <tr><td><code>priceToBook</code></td><td>number</td><td>市净率</td><td>是</td></tr>
+        <tr><td><code>dividendYield / dividendRate</code></td><td>number</td><td>股息率 / 股息额</td><td>是</td></tr>
+        <tr><td><code>trailingEps</code></td><td>number</td><td>每股收益（TTM）</td><td>是</td></tr>
+        <tr><td><code>fiftyDayAverage / twoHundredDayAverage</code></td><td>number</td><td>50日 / 200日均线</td><td>是</td></tr>
+        <tr><td><code>totalRevenue</code></td><td>number</td><td>总营收</td><td>是</td></tr>
+        <tr><td><code>freeCashflow</code></td><td>number</td><td>自由现金流</td><td>是</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="fcard" style="margin-top:18px">
+    <h3>K线时间范围与数据说明</h3>
+    <ul>
+      <li><span class="k">日K</span><span class="d">近 5 年；不含延长时段（盘中聚合）</span></li>
+      <li><span class="k">1小时K</span><span class="d">近 6 个月；美股含盘前盘后延长时段（4:00–20:00 美东）</span></li>
+      <li><span class="k">1分钟K</span><span class="d">近 5 天；美股含延长时段</span></li>
+      <li><span class="k">5m/15m/30m</span><span class="d">由 1m 重采样派生（Open 首 / High 最高 / Low 最低 / Close 末 / Volume 求和）</span></li>
+      <li><span class="k">时间戳</span><span class="d">分钟K为 UTC 时间；日K为交易日期</span></li>
+    </ul>
   </div>
 </div></section>
 

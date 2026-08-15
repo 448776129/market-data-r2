@@ -116,3 +116,70 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: python scripts/sync_incremental.py --region kr
+
+  # ============ 媒体信息采集（刷新名称/币种/52周高低等快照） ============
+  # 媒体信息变化较慢，仅手动触发采集（首次部署时运行一次即可）
+  # 运行：Actions → Sync Data → Run workflow → region=all
+  fetch-meta-cn:
+    name: Meta · A股 (batch ${{ matrix.batch }})
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'cn') }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        batch: [0, 1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch meta -> R2 (cn)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          FETCH_CONCURRENCY: "8"
+        run: python scripts/fetch_meta.py --region cn --batch ${{ matrix.batch }} --batches 5
+
+  fetch-meta-us:
+    name: Meta · 美股Russell1000
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'us') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch meta -> R2 (us)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          FETCH_CONCURRENCY: "10"
+        run: python scripts/fetch_meta.py --region us
+
+  fetch-meta-hk-kr:
+    name: Meta · 恒生 + KOSPI200
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.region == 'all' || github.event.inputs.region == 'hk' || github.event.inputs.region == 'kr') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch meta -> R2 (hk + kr)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python scripts/fetch_meta.py --region hk
+          python scripts/fetch_meta.py --region kr
