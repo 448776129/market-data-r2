@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from pathlib import Path
 
@@ -185,17 +187,30 @@ def sync_minute_and_derived(region: str, symbol: str) -> int:
     return added
 
 
+def _process_one(reg: str, symbol: str, do_minute: bool) -> tuple[str, int, str]:
+    """并发处理单只股票：返回 (symbol, added, err_msg)。err_msg 空表示成功。"""
+    try:
+        added_d = fetch_incremental(reg, symbol, "1d")
+        added_m = 0
+        if do_minute:
+            added_m = sync_minute_and_derived(reg, symbol)
+        return symbol, added_d + added_m, ""
+    except Exception as exc:  # noqa: BLE001
+        return symbol, 0, str(exc)
+
+
 def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
     regions = [region] if region else list(config.REGIONS)
+    # 并发线程数（可用环境变量 FETCH_CONCURRENCY 覆盖）
+    concurrency = int(os.environ.get("FETCH_CONCURRENCY", "6"))
 
     # 分钟K：先判断各市场是否处于交易时段，休市市场跳过
-    active_regions = []
+    active_regions = set()
     for reg in regions:
         if marketlib.is_market_session(reg):
-            active_regions.append(reg)
+            active_regions.add(reg)
         else:
             print(f"[跳过] {reg}: 当前不在交易时段（周末/休市），跳过分钟K", flush=True)
-    regions_minute = active_regions
 
     total_added = 0
     failed: list[str] = []
@@ -205,27 +220,24 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
         symbols = marketlib.slice_batch(symbols, batch, batches)
         if not symbols:
             continue
-        print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches})", flush=True)
+        print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
 
-        for i, symbol in enumerate(symbols):
-            try:
-                # 日K增量总是尝试（含休市查重）
-                added_d = fetch_incremental(reg, symbol, "1d")
-                added_m = 0
-                # 分钟K：仅交易时段市场拉取
-                if reg in regions_minute:
-                    added_m = sync_minute_and_derived(reg, symbol)
-                if added_d or added_m:
-                    total_added += added_d + added_m
+        do_minute = reg in active_regions
+        done = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_process_one, reg, sym, do_minute): sym for sym in symbols}
+            for fut in as_completed(futures):
+                sym, added, err = fut.result()
+                done += 1
+                if err:
+                    failed.append(f"{reg}:{sym}")
+                elif added:
+                    total_added += added
+                if done % 25 == 0 or done == len(symbols):
                     print(
-                        f"  [{i+1}/{len(symbols)}] {symbol}: +{added_d} 日K, +{added_m} 分钟",
+                        f"  [{done}/{len(symbols)}] {reg} 已处理，累计新增 {total_added} 行，失败 {len(failed)}",
                         flush=True,
                     )
-                # 无新增也 sleep，控制频率（脚本可能全量补缺）
-                time.sleep(config.REQUEST_DELAY)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  [失败] {symbol}: {exc}", flush=True)
-                failed.append(f"{reg}:{symbol}")
 
     r2store.put_status(
         {

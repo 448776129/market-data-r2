@@ -25,8 +25,10 @@ gzip 压缩后并发上传 R2（scripts/r2store.py）。
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -111,10 +113,28 @@ def fetch_symbol(region: str, symbol: str) -> dict[str, pd.DataFrame] | None:
     return result or None
 
 
+def _process_one(reg: str, symbol: str) -> tuple[str, dict | None]:
+    """拉取并上传单只股票，返回 (symbol, data)。data 为 None 表示失败。"""
+    data = fetch_symbol(reg, symbol)
+    if data is None:
+        return symbol, None
+    items: list[tuple[str, str, bool]] = []
+    for interval, df in data.items():
+        subdir = SUBDIR[interval]
+        index_col = DATE_COL if interval == "1d" else DT_COL
+        key = f"{reg}/{subdir}/{symbol}.csv"
+        items.append((key, df_to_csv(df, index_col), True))
+    if items:
+        r2store.upload_many(items)
+    return symbol, data
+
+
 def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
     regions = [region] if region else list(config.REGIONS)
     ok_files = 0
     fail_symbols: list[str] = []
+    # 并发拉取线程数（可用环境变量 FETCH_CONCURRENCY 覆盖）
+    concurrency = int(os.environ.get("FETCH_CONCURRENCY", "6"))
 
     for reg in regions:
         symbols = marketlib.load_symbols(reg)
@@ -122,38 +142,20 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
         if not symbols:
             print(f"[警告] {reg}: 无符号（universe 缺失？）", flush=True)
             continue
-        print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches})", flush=True)
+        print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
 
-        for i, symbol in enumerate(symbols):
-            t0 = time.time()
-            data = fetch_symbol(reg, symbol)
-            if data is None:
-                fail_symbols.append(f"{reg}:{symbol}")
-                continue
-
-            # 组装待上传对象
-            items: list[tuple[str, str, bool]] = []
-            for interval, df in data.items():
-                subdir = SUBDIR[interval]
-                index_col = DATE_COL if interval == "1d" else DT_COL
-                key = f"{reg}/{subdir}/{symbol}.csv"
-                items.append((key, df_to_csv(df, index_col), True))
-
-            if items:
-                res = r2store.upload_many(items)
-                ok_files += res["ok"]
-                if res["fail"]:
-                    fail_symbols.append(f"{reg}:{symbol}")
-
-            elapsed = time.time() - t0
-            print(
-                f"  [{i+1}/{len(symbols)}] {symbol}: "
-                f"{','.join(k + '(' + str(len(v)) + ')' for k, v in data.items())} "
-                f"({elapsed:.1f}s)",
-                flush=True,
-            )
-            # 请求间隔，避免触发 Yahoo 限流
-            time.sleep(config.REQUEST_DELAY)
+        done = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_process_one, reg, sym): sym for sym in symbols}
+            for fut in as_completed(futures):
+                sym, data = fut.result()
+                done += 1
+                if data is None:
+                    fail_symbols.append(f"{reg}:{sym}")
+                else:
+                    ok_files += sum(1 for _ in data)
+                if done % 25 == 0 or done == len(symbols):
+                    print(f"  [{done}/{len(symbols)}] {reg} 已处理，失败 {len(fail_symbols)}", flush=True)
 
         # 区域清单一并上传（供 Worker /universe 读取）
         csv_text = "\n".join(symbols) + "\n"
