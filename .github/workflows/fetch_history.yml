@@ -119,11 +119,14 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: python scripts/fetch_history.py --region kr
 
-  # ============ 美股 ETF（355 只） ============
+  # ============ 美股 ETF（831 只，分 4 批） ============
   history-etf:
-    name: History · 美股ETF
+    name: History · 美股ETF (batch ${{ matrix.batch }})
     if: ${{ github.event.inputs.region == 'all' || github.event.inputs.region == 'etf' }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        batch: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -138,7 +141,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           FETCH_CONCURRENCY: "8"
-        run: python scripts/fetch_history.py --region etf
+        run: python scripts/fetch_history.py --region etf --batch ${{ matrix.batch }} --batches 4
 
   # ============ 中国（A股）ETF（211 只） ============
   history-cn-etf:
