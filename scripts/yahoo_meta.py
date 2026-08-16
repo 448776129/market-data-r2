@@ -91,3 +91,35 @@ def _normalize(meta: dict) -> dict:
         "change": change,
         "changePercent": change_percent,
     }
+
+
+def fetch_meta_full(symbol: str, retries: int | None = None, delay: float | None = None) -> dict:
+    """拉取单只股票的增强 meta：chart meta + search 接口的板块/行业字段。
+
+    Yahoo quoteSummary（市值/PE/财务等完整基本面）已对免费通道系统性 429
+    限流，无法获取。这里通过免费的 /v1/finance/search 接口补充
+    sector / industry / quoteType / 交易所等字段，尽量接近旧仓库的完整 meta。
+    """
+    meta = fetch_meta(symbol, retries=retries, delay=delay)
+    if not meta:
+        return meta
+
+    try:
+        import yahoo_news  # noqa: F401 - 复用 search 客户端
+
+        data = yahoo_news.fetch_news(symbol, news_count=0, retries=retries, delay=delay)
+        quote = data.get("quote") or {}
+        if quote:
+            meta["quoteType"] = quote.get("quoteType")
+            meta["sector"] = quote.get("sector") or quote.get("sectorDisp")
+            meta["industry"] = quote.get("industry") or quote.get("industryDisp")
+            if not meta.get("exchange"):
+                meta["exchange"] = quote.get("exchDisp") or quote.get("exchange")
+            if not meta.get("longName"):
+                meta["longName"] = quote.get("longname")
+            if not meta.get("shortName"):
+                meta["shortName"] = quote.get("shortname")
+    except Exception:  # noqa: BLE001 - 板块字段失败不影响主 meta
+        pass
+
+    return meta

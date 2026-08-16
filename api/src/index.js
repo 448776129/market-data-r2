@@ -307,6 +307,34 @@ async function handleKline(params, env) {
 }
 
 // ============================================================
+// 新闻（从 R2 {region}/news/{symbol}.json 读取）
+// ============================================================
+async function handleNews(params, env) {
+  const symbol = (params.get("symbol") || "").trim().toUpperCase();
+  if (!symbol) {
+    return json({
+      usage: {
+        endpoint: `${API_BASE}/news`,
+        description: "查询个股相关新闻（采集端经 Yahoo search 采集入库）",
+        params: { symbol: "股票代码（必填）" },
+        example: `${API_BASE}/news?symbol=AAPL`,
+      },
+    });
+  }
+  const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
+  const text = await fetchWithFallback(`data/${region}/news/${symbol}.json`, env);
+  if (text === null) {
+    return error(`No news for ${symbol}. File not found: data/${region}/news/${symbol}.json`, 404);
+  }
+  try {
+    const data = JSON.parse(text);
+    return json(data);
+  } catch {
+    return error(`Invalid news JSON for ${symbol}`, 502);
+  }
+}
+
+// ============================================================
 // 个股元数据（quote）
 // ============================================================
 async function handleQuote(params, env) {
@@ -629,6 +657,7 @@ function handleStatus(request) {
       price: `${API_BASE}/price`,
       download: `${API_BASE}/download`,
       quote: `${API_BASE}/quote`,
+      news: `${API_BASE}/news`,
       universe: `${API_BASE}/universe`,
       indices: `${API_BASE}/indices`,
       symbols: `${API_BASE}/symbols`,
@@ -845,6 +874,7 @@ const HOME_HTML = `<!DOCTYPE html>
     <div class="ep"><div class="m">GET /price</div><div class="d">实时价格（当场调取 Yahoo API，含涨跌幅/52周高低，非数据库缓存）</div><div class="ex">/price?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（体积小，可离线分析）</div><div class="ex">/download?symbol=AAPL&amp;interval=1h</div></div>
     <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
+    <div class="ep"><div class="m">GET /news</div><div class="d">个股相关新闻（标题/来源/时间，采集端入库）</div><div class="ex">/news?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
     <div class="ep"><div class="m">GET /indices</div><div class="d">全部可用指数/清单及其成分数量</div><div class="ex">/indices</div></div>
     <div class="ep"><div class="m">GET /symbols</div><div class="d">按区域列出股票代码（支持分页）</div><div class="ex">/symbols?region=cn&amp;limit=10</div></div>
@@ -1078,6 +1108,8 @@ export default {
         return await handleKline(params, env);
       case "/quote":
         return await handleQuote(params, env);
+      case "/news":
+        return await handleNews(params, env);
       case "/price":
         return await handlePrice(params, env);
       case "/download":
@@ -1092,7 +1124,7 @@ export default {
         return handleStatus(request);
       default:
         return error(
-          "Not found. Use /, /kline, /price, /download, /quote, /universe, /indices, /symbols, /status",
+          "Not found. Use /, /kline, /price, /download, /quote, /news, /universe, /indices, /symbols, /status",
           404
         );
     }

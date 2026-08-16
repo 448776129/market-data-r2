@@ -4,26 +4,31 @@
 
 - **在线接口**：https://stockapi.365200.xyz
 - **文档首页**：https://stockapi.365200.xyz/
-- **数据仓库**：[448776129/market-data-pipeline](https://github.com/448776129/market-data-pipeline)（公开）
+- **数据仓库**：[448776129/market-data-r2](https://github.com/448776129/market-data-r2)（公开）
 
 ## 数据架构
 
 ```
 GitHub Actions（采集）
-  ├─ Fetch History (Full)   手动触发 · 一次性全量历史（日K 5y / 1m 5d / 1h 6mo / 延长时段）
-  └─ Sync Data (Incremental) 每 1 小时 · 增量同步（新增数据）
-        │  经 Yahoo chart API + 反代访问，gzip 压缩
+  ├─ Fetch History (Full)    手动触发 · 一次性全量历史（日K 5y / 1m 5d / 1h 6mo / 延长时段）
+  ├─ Sync Data (Incremental) 每 30 分钟 · 增量同步（新增数据）
+  ├─ Fetch Meta              手动触发 · 基本面 meta
+  └─ Fetch News              手动触发 · 新闻
+        │  经 Yahoo chart/search API + 反代访问，gzip 压缩
         ▼
-Cloudflare R2（存储，5G）
+Cloudflare R2（存储）
         │
         ▼
 Cloudflare Worker（stockapi.365200.xyz）
-  ├─ GET /kline      K线数据（日K/1m/5m/15m/30m/1h）
-  ├─ GET /quote      个股元数据
-  ├─ GET /universe   指数/区域股票清单
-  ├─ GET /indices    可用清单及成分数量
-  ├─ GET /symbols    按区域列出股票代码
-  └─ GET /status     服务配置信息
+  ├─ GET /kline       K线数据（日K/1m/5m/15m/30m/1h，走 R2）
+  ├─ GET /price       实时价格（当场调取 Yahoo，非缓存）
+  ├─ GET /download    下载 gzip 压缩的原始 CSV
+  ├─ GET /quote       个股元数据（基本面 meta）
+  ├─ GET /news        个股新闻
+  ├─ GET /universe    指数/区域股票清单
+  ├─ GET /indices     可用清单及成分数量
+  ├─ GET /symbols     按区域列出股票代码
+  └─ GET /status      服务配置信息
 ```
 
 ## 支持的股票范围
@@ -32,8 +37,10 @@ Cloudflare Worker（stockapi.365200.xyz）
 | ---- | ---- | ---- | ---- |
 | 美股 | `us` | Russell 1000（IWB 持仓） | 1022 只 |
 | 沪深A股 | `cn` | 沪深全市场（沪+深） | 4595 只 |
-| 港股 | `hk` | 恒生指数全部成分股 | 88 只 |
-| 韩股 | `kr` | KOSPI 200 前 50 核心成分股 | 48 只 |
+| 港股 | `hk` | 恒生指数成分股 | 87 只 |
+| 韩股 | `kr` | KOSPI 200 核心成分股 | 48 只 |
+| 美股ETF | `etf` | 市值前 500 + 用户主题 ETF | 831 只 |
+| 中国ETF | `cn_etf` | 用户指定 A 股 ETF | 211 只 |
 
 ## K 线数据
 
@@ -92,13 +99,37 @@ GET https://stockapi.365200.xyz/kline?symbol=AAPL&interval=1d&limit=5
 
 ## 其它接口
 
-### 个股元数据
+### 实时价格（当场调取 Yahoo）
+
+```
+GET https://stockapi.365200.xyz/price?symbol=AAPL
+```
+
+返回实时价格、涨跌幅、52周高低、名称、币种等。**不走 R2 数据库**，当场调取 Yahoo chart API，保证最新。
+
+### 个股元数据（基本面 meta）
 
 ```
 GET https://stockapi.365200.xyz/quote?symbol=600519.SS
 ```
 
-返回名称、行业、市值、最新价、52周高低、PE/PB 等（来自 Yahoo info 快照）。
+返回名称、行业、板块、最新价、52周高低、交易所、币种等（采集端经 chart + search 接口采集）。
+
+### 个股新闻
+
+```
+GET https://stockapi.365200.xyz/news?symbol=AAPL
+```
+
+返回新闻列表（标题、来源、发布时间、链接），采集端经 Yahoo search 接口入库。
+
+### 下载 gzip CSV
+
+```
+GET https://stockapi.365200.xyz/download?symbol=AAPL&interval=1h
+```
+
+返回 R2 中存储的原始 gzip 压缩 CSV（`Content-Disposition: attachment`），体积小，适合离线分析。
 
 ### 股票清单
 
