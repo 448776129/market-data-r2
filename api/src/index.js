@@ -363,30 +363,65 @@ async function handleQuote(params, env) {
     return error(`Invalid meta JSON for ${symbol}`, 502);
   }
 
-  // 兼容两种结构：扁平（chart meta）与嵌套（旧 yfinance info）
+  // 兼容两种结构：扁平（当前采集的 chart meta + search）与嵌套（旧 yfinance info）
   const info = meta.info || meta;
-  const pick = [
-    "longName", "shortName", "sector", "industry", "country", "exchange",
-    "currency", "marketCap", "currentPrice", "open", "previousClose",
-    "dayHigh", "dayLow", "regularMarketPrice", "regularMarketPreviousClose",
-    "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "trailingPE", "forwardPE",
-    "priceToBook", "dividendYield", "dividendRate", "trailingEps",
-    "fiftyDayAverage", "twoHundredDayAverage", "totalRevenue", "freeCashflow",
+
+  // 完整暴露已入库的基本面字段（不丢字段）
+  const flatKeys = [
+    // 标识
+    "symbol", "longName", "shortName", "currency", "exchange",
+    "instrumentType", "quoteType", "sector", "industry",
+    "firstTradeDate", "timezone", "gmtoffset", "hasPrePostMarketData",
+    // 行情快照
+    "regularMarketPrice", "regularMarketDayHigh", "regularMarketDayLow",
+    "regularMarketVolume", "regularMarketTime",
+    "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "chartPreviousClose",
+    "change", "changePercent",
   ];
-  const quote = {};
-  for (const k of pick) {
-    if (info[k] !== undefined && info[k] !== null) quote[k] = info[k];
+  const flat = {};
+  for (const k of flatKeys) {
+    if (info[k] !== undefined && info[k] !== null) flat[k] = info[k];
   }
 
-  return json({
+  // 嵌套结构（旧 yfinance info）的字段原样透出
+  const nestedPick = [
+    "country", "marketCap", "currentPrice", "open", "previousClose",
+    "dayHigh", "dayLow", "regularMarketPreviousClose",
+    "trailingPE", "forwardPE", "priceToBook", "dividendYield", "dividendRate",
+    "trailingEps", "forwardEps", "beta", "volume", "averageVolume",
+    "sharesOutstanding", "floatShares", "targetMeanPrice", "targetHighPrice",
+    "targetLowPrice", "recommendationKey", "totalRevenue", "grossProfits",
+    "freeCashflow", "totalDebt", "totalCash", "profitMargins",
+    "returnOnEquity", "returnOnAssets", "earningsGrowth", "revenueGrowth",
+    "fiftyDayAverage", "twoHundredDayAverage",
+  ];
+  const nested = {};
+  for (const k of nestedPick) {
+    if (info[k] !== undefined && info[k] !== null) nested[k] = info[k];
+  }
+
+  const result = {
     symbol: meta.symbol || symbol,
     region: meta.region || region,
     name: meta.longName || meta.shortName || meta.name,
     currency: meta.currency,
     exchange: meta.exchange || meta.fullExchangeName || info.exchange,
     isin: meta.isin || null,
-    quote,
-  });
+    ...flat,
+    ...nested,
+  };
+  // 若存在旧嵌套 info，一并透出完整 info + 财务/分红等（供参考）
+  if (meta.info) result.info = meta.info;
+  if (meta.financials) result.financials = meta.financials;
+  if (meta.dividends) result.dividends = meta.dividends;
+  if (meta.splits) result.splits = meta.splits;
+  if (meta.recommendations_summary) result.recommendations_summary = meta.recommendations_summary;
+  if (meta.earnings_dates) result.earnings_dates = meta.earnings_dates;
+  if (meta.major_holders) result.major_holders = meta.major_holders;
+  if (meta.institutional_holders) result.institutional_holders = meta.institutional_holders;
+  if (meta.analyst_price_targets) result.analyst_price_targets = meta.analyst_price_targets;
+
+  return json(result);
 }
 
 // ============================================================
@@ -965,46 +1000,78 @@ const HOME_HTML = `<!DOCTYPE html>
       <tbody>
         <tr><td><code>symbol</code></td><td>string</td><td>股票代码</td><td><code>"AAPL"</code></td><td>否</td></tr>
         <tr><td><code>region</code></td><td>string</td><td>市场区域</td><td><code>"us"</code></td><td>否</td></tr>
-        <tr><td><code>name</code></td><td>string</td><td>公司名称</td><td><code>"Apple Inc."</code></td><td>是</td></tr>
+        <tr><td><code>name</code></td><td>string</td><td>公司名称（longName 或 shortName）</td><td><code>"Apple Inc."</code></td><td>是</td></tr>
         <tr><td><code>currency</code></td><td>string</td><td>计价货币</td><td><code>"USD"</code></td><td>是</td></tr>
         <tr><td><code>exchange</code></td><td>string</td><td>交易所名称</td><td><code>"NasdaqGS"</code></td><td>是</td></tr>
-        <tr><td><code>isin</code></td><td>string</td><td>ISIN 代码</td><td><code>"US0378331005"</code></td><td>是</td></tr>
-        <tr><td><code>quote.longName</code></td><td>string</td><td>公司全称</td><td><code>"Apple Inc."</code></td><td>是</td></tr>
-        <tr><td><code>quote.fiftyTwoWeekHigh</code></td><td>number</td><td>52周最高价</td><td><code>344.57</code></td><td>是</td></tr>
-        <tr><td><code>quote.fiftyTwoWeekLow</code></td><td>number</td><td>52周最低价</td><td><code>223.78</code></td><td>是</td></tr>
-        <tr><td><code>quote.regularMarketPrice</code></td><td>number</td><td>最新价</td><td><code>305.93</code></td><td>是</td></tr>
-        <tr><td><code>quote.sector</code></td><td>string</td><td>所属行业板块</td><td><code>"Technology"</code></td><td>是</td></tr>
-        <tr><td><code>quote.marketCap</code></td><td>number</td><td>总市值（元）</td><td><code>4.65e12</code></td><td>是</td></tr>
-        <tr><td><code>quote.trailingPE</code></td><td>number</td><td>市盈率（TTM）</td><td><code>35.2</code></td><td>是</td></tr>
-        <tr><td><code>quote.dividendYield</code></td><td>number</td><td>股息率（小数）</td><td><code>0.004</code></td><td>是</td></tr>
-        <tr><td><code>quote.totalRevenue</code></td><td>number</td><td>总营收（元）</td><td><code>3.9e11</code></td><td>是</td></tr>
-        <tr><td><code>quote.freeCashflow</code></td><td>number</td><td>自由现金流（元）</td><td><code>1.1e11</code></td><td>是</td></tr>
-        <tr><td colspan="2" class="dim-row">其余 <code>quote.*</code> 字段</td><td>见下方「quote 子字段」清单</td><td colspan="2"></td></tr>
+        <tr><td><code>isin</code></td><td>string</td><td>ISIN 国际证券识别码</td><td><code>"US0378331005"</code></td><td>是</td></tr>
+        <tr><td><code>instrumentType</code></td><td>string</td><td>证券类型（EQUITY/ETF）</td><td><code>"EQUITY"</code></td><td>是</td></tr>
+        <tr><td><code>quoteType</code></td><td>string</td><td>Yahoo 报价类型</td><td><code>"EQUITY"</code></td><td>是</td></tr>
+        <tr><td><code>sector</code></td><td>string</td><td>所属行业板块（如 Technology）</td><td><code>"Technology"</code></td><td>是</td></tr>
+        <tr><td><code>industry</code></td><td>string</td><td>细分行业</td><td><code>"Consumer Electronics"</code></td><td>是</td></tr>
+        <tr><td><code>firstTradeDate</code></td><td>number</td><td>上市日期（Unix 秒）</td><td><code>345459600</code></td><td>是</td></tr>
+        <tr><td><code>timezone</code></td><td>string</td><td>交易所时区</td><td><code>"America/New_York"</code></td><td>是</td></tr>
+        <tr><td><code>gmtoffset</code></td><td>number</td><td>时区偏移（秒）</td><td><code>-18000</code></td><td>是</td></tr>
+        <tr><td><code>hasPrePostMarketData</code></td><td>boolean</td><td>是否有盘前盘后数据</td><td><code>true</code></td><td>是</td></tr>
+        <tr><td><code>regularMarketPrice</code></td><td>number</td><td>最新价</td><td><code>305.93</code></td><td>是</td></tr>
+        <tr><td><code>regularMarketDayHigh</code></td><td>number</td><td>当日最高</td><td><code>306.20</code></td><td>是</td></tr>
+        <tr><td><code>regularMarketDayLow</code></td><td>number</td><td>当日最低</td><td><code>300.57</code></td><td>是</td></tr>
+        <tr><td><code>regularMarketVolume</code></td><td>number</td><td>当日成交量</td><td><code>41657800</code></td><td>是</td></tr>
+        <tr><td><code>regularMarketTime</code></td><td>number</td><td>最新行情时间（Unix 秒）</td><td><code>1786828800</code></td><td>是</td></tr>
+        <tr><td><code>fiftyTwoWeekHigh</code></td><td>number</td><td>52周最高价</td><td><code>344.57</code></td><td>是</td></tr>
+        <tr><td><code>fiftyTwoWeekLow</code></td><td>number</td><td>52周最低价</td><td><code>223.78</code></td><td>是</td></tr>
+        <tr><td><code>chartPreviousClose</code></td><td>number</td><td>前收盘价</td><td><code>305.26</code></td><td>是</td></tr>
+        <tr><td><code>change</code></td><td>number</td><td>涨跌额</td><td><code>0.67</code></td><td>是</td></tr>
+        <tr><td><code>changePercent</code></td><td>number</td><td>涨跌幅（%）</td><td><code>0.22</code></td><td>是</td></tr>
       </tbody>
     </table>
   </div>
 
-  <h3 class="fsub">quote 子字段清单 <span class="tag">GET /quote 返回的 quote 对象</span></h3>
+  <h3 class="fsub">quote 财务/估值子字段 <span class="tag">旧 yfinance 完整 meta（若已入库）</span></h3>
   <div class="ftable">
     <table>
       <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>可空</th></tr></thead>
       <tbody>
-        <tr><td><code>longName / shortName</code></td><td>string</td><td>公司全称 / 简称</td><td>是</td></tr>
-        <tr><td><code>sector / industry</code></td><td>string</td><td>板块 / 行业</td><td>是</td></tr>
-        <tr><td><code>country / exchange</code></td><td>string</td><td>国家 / 交易所</td><td>是</td></tr>
-        <tr><td><code>currency</code></td><td>string</td><td>计价货币</td><td>是</td></tr>
-        <tr><td><code>marketCap</code></td><td>number</td><td>总市值</td><td>是</td></tr>
-        <tr><td><code>currentPrice / regularMarketPrice</code></td><td>number</td><td>最新价</td><td>是</td></tr>
-        <tr><td><code>open / previousClose</code></td><td>number</td><td>今开 / 昨收</td><td>是</td></tr>
-        <tr><td><code>dayHigh / dayLow</code></td><td>number</td><td>当日高低</td><td>是</td></tr>
-        <tr><td><code>fiftyTwoWeekHigh / Low</code></td><td>number</td><td>52周高低</td><td>是</td></tr>
+        <tr><td><code>marketCap</code></td><td>number</td><td>总市值（元）</td><td>是</td></tr>
         <tr><td><code>trailingPE / forwardPE</code></td><td>number</td><td>TTM / 前瞻市盈率</td><td>是</td></tr>
-        <tr><td><code>priceToBook</code></td><td>number</td><td>市净率</td><td>是</td></tr>
-        <tr><td><code>dividendYield / dividendRate</code></td><td>number</td><td>股息率 / 股息额</td><td>是</td></tr>
-        <tr><td><code>trailingEps</code></td><td>number</td><td>每股收益（TTM）</td><td>是</td></tr>
-        <tr><td><code>fiftyDayAverage / twoHundredDayAverage</code></td><td>number</td><td>50日 / 200日均线</td><td>是</td></tr>
-        <tr><td><code>totalRevenue</code></td><td>number</td><td>总营收</td><td>是</td></tr>
+        <tr><td><code>priceToBook</code></td><td>number</td><td>市净率（P/B）</td><td>是</td></tr>
+        <tr><td><code>dividendYield / dividendRate</code></td><td>number</td><td>股息率（小数）/ 每股股息</td><td>是</td></tr>
+        <tr><td><code>trailingEps / forwardEps</code></td><td>number</td><td>每股收益 TTM / 预测 EPS</td><td>是</td></tr>
+        <tr><td><code>beta</code></td><td>number</td><td>Beta 波动系数</td><td>是</td></tr>
+        <tr><td><code>volume / averageVolume</code></td><td>number</td><td>成交量 / 平均成交量</td><td>是</td></tr>
+        <tr><td><code>sharesOutstanding / floatShares</code></td><td>number</td><td>总股本 / 流通股本</td><td>是</td></tr>
+        <tr><td><code>targetMeanPrice / HighPrice / LowPrice</code></td><td>number</td><td>分析师目标价（均值/最高/最低）</td><td>是</td></tr>
+        <tr><td><code>recommendationKey</code></td><td>string</td><td>分析师评级（buy/hold/sell）</td><td>是</td></tr>
+        <tr><td><code>totalRevenue / grossProfits</code></td><td>number</td><td>总营收 / 毛利</td><td>是</td></tr>
         <tr><td><code>freeCashflow</code></td><td>number</td><td>自由现金流</td><td>是</td></tr>
+        <tr><td><code>totalDebt / totalCash</code></td><td>number</td><td>总负债 / 总现金</td><td>是</td></tr>
+        <tr><td><code>profitMargins</code></td><td>number</td><td>利润率（小数）</td><td>是</td></tr>
+        <tr><td><code>returnOnEquity / returnOnAssets</code></td><td>number</td><td>净资产收益率 / 总资产收益率</td><td>是</td></tr>
+        <tr><td><code>earningsGrowth / revenueGrowth</code></td><td>number</td><td>盈利 / 营收增长率（小数）</td><td>是</td></tr>
+        <tr><td><code>fiftyDayAverage / twoHundredDayAverage</code></td><td>number</td><td>50日 / 200日均线</td><td>是</td></tr>
+        <tr><td><code>financials</code></td><td>array</td><td>年度财务数据（若已入库）</td><td>是</td></tr>
+        <tr><td><code>dividends</code></td><td>array</td><td>历史分红记录（若已入库）</td><td>是</td></tr>
+        <tr><td><code>splits</code></td><td>array</td><td>拆股记录（若已入库）</td><td>是</td></tr>
+        <tr><td><code>recommendations_summary</code></td><td>array</td><td>分析师评级汇总（若已入库）</td><td>是</td></tr>
+        <tr><td><code>major_holders / institutional_holders</code></td><td>array</td><td>大股东 / 机构持股（若已入库）</td><td>是</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="fsub">四、新闻 <span class="tag">GET /news</span></h3>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>symbol</code></td><td>string</td><td>股票代码</td><td><code>"AAPL"</code></td><td>否</td></tr>
+        <tr><td><code>news[]</code></td><td>array</td><td>新闻数组</td><td><code>[...]</code></td><td>否</td></tr>
+        <tr><td><code>news[].title</code></td><td>string</td><td>新闻标题</td><td><code>"Apple earnings beat"</code></td><td>否</td></tr>
+        <tr><td><code>news[].publisher</code></td><td>string</td><td>新闻来源</td><td><code>"Reuters"</code></td><td>是</td></tr>
+        <tr><td><code>news[].providerPublishTime</code></td><td>number</td><td>发布时间（Unix 秒）</td><td><code>1786824538</code></td><td>是</td></tr>
+        <tr><td><code>news[].link</code></td><td>string</td><td>新闻链接</td><td><code>"https://..."</code></td><td>是</td></tr>
+        <tr><td><code>news[].type</code></td><td>string</td><td>内容类型（STORY 等）</td><td><code>"STORY"</code></td><td>是</td></tr>
+        <tr><td><code>news[].relatedTickers</code></td><td>array</td><td>关联股票代码</td><td><code>["AAPL"]</code></td><td>是</td></tr>
+        <tr><td><code>quote</code></td><td>object</td><td>关联行情快照（板块/行业等）</td><td><code>{...}</code></td><td>是</td></tr>
+        <tr><td><code>collected_at</code></td><td>string</td><td>采集时间（ISO）</td><td><code>"2026-08-16T11:00:00Z"</code></td><td>否</td></tr>
       </tbody>
     </table>
   </div>
