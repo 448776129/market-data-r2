@@ -1,0 +1,78 @@
+name: Test YFinance Meta
+
+# 临时测试工作流：验证在 GitHub Actions（海外 runner）环境下
+# 能否通过 yfinance 获取完整 meta 信息（市值/PE/财务/分红/评级等）。
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  test-yf-meta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install yfinance==0.2.44 pandas==2.2.3
+
+      - name: Test yfinance meta fetch
+        run: |
+          python -c "
+          import yfinance as yf
+          import json
+
+          t = yf.Ticker('AAOI')
+          print('=== .info ===')
+          info = t.info
+          keys = ['longName','sector','industry','marketCap','currentPrice','trailingPE',
+                  'forwardPE','priceToBook','beta','targetMeanPrice','recommendationKey',
+                  'totalRevenue','freeCashflow','totalDebt','totalCash','profitMargins',
+                  'returnOnEquity','revenueGrowth']
+          ok = {}
+          for k in keys:
+              if k in info:
+                  ok[k] = info[k]
+          print(json.dumps(ok, indent=2, ensure_ascii=False))
+          print('INFO_FIELDS:', len(info))
+
+          print()
+          print('=== .dividends 最近 ===')
+          try:
+              div = t.dividends
+              print(div.tail(3).to_string() if len(div) else '无分红')
+          except Exception as e:
+              print('dividends err:', e)
+
+          print()
+          print('=== .splits 最近 ===')
+          try:
+              sp = t.splits
+              print(sp.tail(3).to_string() if len(sp) else '无拆分')
+          except Exception as e:
+              print('splits err:', e)
+
+          print()
+          print('=== .financials 前5行 ===')
+          try:
+              fin = t.financials
+              if fin is not None and not fin.empty:
+                  print('shape:', fin.shape)
+                  print(fin.head(3).to_string())
+              else:
+                  print('无财务数据')
+          except Exception as e:
+              print('financials err:', e)
+
+          print()
+          print('=== .recommendations 最近 ===')
+          try:
+              rec = t.recommendations
+              print(rec.tail(3).to_string() if rec is not None and len(rec) else '无')
+          except Exception as e:
+              print('recommendations err:', e)
+          "
