@@ -120,6 +120,7 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
         print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
 
         done = 0
+        reg_changed = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
                 pool.submit(_process_one, reg, sym, snap.get(sym)): sym for sym in symbols
@@ -131,17 +132,18 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
                     ok_count += 1
                     if fp is not None:
                         snap[sym] = {"h": fp}
-                        changed_count += 1
+                        reg_changed += 1
                 else:
                     failed.append(f"{reg}:{sym}")
                 if done % 50 == 0 or done == len(symbols):
                     print(
-                        f"  [{done}/{len(symbols)}] {reg} 成功 {ok_count}，新增写入 {changed_count}，失败 {len(failed)}",
+                        f"  [{done}/{len(symbols)}] {reg} 成功 {ok_count}，新增写入 {reg_changed}，失败 {len(failed)}",
                         flush=True,
                     )
-        # 仅当本轮确实产生 / 刷新过该批状态时才写回，避免无谓写操作
-        if snap:
+        # 仅当本轮确实有新增时才写回清单，避免无谓写操作
+        if reg_changed > 0:
             state.write("news", reg, batch, snap)
+        changed_count += reg_changed
 
     r2store.put_status(
         {
