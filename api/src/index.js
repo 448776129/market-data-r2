@@ -704,32 +704,40 @@ async function handleSymbols(params, env) {
 
 // ============================================================
 // 聚合新闻
+//   /news-yh → 雅虎香港财经头条（繁体）
+//   /news-em → 东方财富 7x24h 快讯（简体）
+//   /news    → 以上两源合并按发布时间倒序（扁平列表）
+// 默认 limit = 20；?limit=N 获取更多或更少；?help=1 返回文档。
 // ============================================================
+const DEFAULT_NEWS_LIMIT = 20;
+
 async function handleAggNews(which, params, env) {
-  // 支持 ?help=1 返回文档
   if (params.get("help") === "1") {
     return json({
       endpoints: {
         "/news-yh": {
-          description: "雅虎香港财经头条（hk.finance.yahoo.com/topic/latest-news/），约 20-25 条，中文繁体。每 5 分钟自动采集。",
+          description: "雅虎香港财经头条（hk.finance.yahoo.com/topic/latest-news/），中文繁体。",
           source_url: "https://hk.finance.yahoo.com/topic/latest-news/",
-          params: { limit: "可选：最多返回条数，默认返回采集的全部" },
-          example: `${API_BASE}/news-yh?limit=10`,
+          params: { limit: `可选：返回条数，默认 ${DEFAULT_NEWS_LIMIT}` },
+          example: `${API_BASE}/news-yh?limit=50`,
         },
         "/news-em": {
-          description: "东方财富 7x24h 财经快讯（kuaixun.eastmoney.com），每次入库 80 条，中文简体。每 5 分钟自动采集。",
+          description: "东方财富 7x24h 财经快讯（kuaixun.eastmoney.com），中文简体。",
           source_url: "https://kuaixun.eastmoney.com/",
-          params: { limit: "可选：最多返回条数" },
-          example: `${API_BASE}/news-em?limit=20`,
+          params: { limit: `可选：返回条数，默认 ${DEFAULT_NEWS_LIMIT}，最多 80` },
+          example: `${API_BASE}/news-em?limit=80`,
         },
         "/news": {
-          description: "聚合新闻：雅虎香港头条 + 东方财富 7x24h 合并，按发布时间倒序。返回 各源原始结构 + merged 扁平列表。",
-          params: { limit: "可选：merged 列表最多返回条数" },
-          example: `${API_BASE}/news?limit=30`,
+          description: "聚合新闻：雅虎香港头条 + 东方财富 7x24h 合并，扁平列表按发布时间倒序。",
+          params: { limit: `可选：返回条数，默认 ${DEFAULT_NEWS_LIMIT}` },
+          example: `${API_BASE}/news?limit=50`,
         },
       },
     });
   }
+
+  const userLimit = parseInt(params.get("limit") || "0", 10);
+  const limit = userLimit > 0 ? userLimit : DEFAULT_NEWS_LIMIT;
 
   if (["yh", "em"].includes(which)) {
     const text = await fetchUpstream(`news/${which}.json`, env);
@@ -738,12 +746,13 @@ async function handleAggNews(which, params, env) {
     }
     try {
       const data = JSON.parse(text);
-      const limit = parseInt(params.get("limit") || "0", 10);
-      if (limit > 0 && Array.isArray(data.news)) {
-        data.news = data.news.slice(0, limit);
-        data.count = data.news.length;
-      }
-      return json(data);
+      const list = (Array.isArray(data.news) ? data.news : []).slice(0, limit);
+      return json({
+        total: Array.isArray(data.news) ? data.news.length : list.length,
+        count: list.length,
+        limit,
+        items: list,
+      });
     } catch {
       return error(`news/${which}.json 解析失败`, 502);
     }
@@ -754,53 +763,52 @@ async function handleAggNews(which, params, env) {
       fetchUpstream("news/yh.json", env),
       fetchUpstream("news/em.json", env),
     ]);
-    const merged = {
-      endpoint: `${API_BASE}/news`,
-      description: "聚合新闻：雅虎香港头条 + 东方财富 7x24h 快讯，按发布时间倒序。",
-      fetched_at: new Date().toISOString(),
-      available: {
-        yahoo_hk: yhRaw !== null,
-        eastmoney: emRaw !== null,
-      },
-      yahoo_hk: yhRaw ? JSON.parse(yhRaw) : null,
-      eastmoney: emRaw ? JSON.parse(emRaw) : null,
-    };
 
-    // 合并成扁平列表
     const items = [];
     if (yhRaw) {
-      const d = JSON.parse(yhRaw);
-      for (const n of d.news || []) {
-        items.push({
-          ...n,
-          _channel: "yahoo_hk",
-        });
-      }
+      try {
+        const d = JSON.parse(yhRaw);
+        for (const n of d.news || []) {
+          items.push({
+            channel: "yahoo_hk",
+            title: n.title,
+            url: n.url,
+            digest: null,
+            pub_ts: n.pub_ts,
+            pub_time: n.pub_time,
+            rel_time: n.rel_time || null,
+            publisher: n.publisher || n.source || null,
+          });
+        }
+      } catch {}
     }
     if (emRaw) {
-      const d = JSON.parse(emRaw);
-      for (const n of d.news || []) {
-        items.push({
-          title: n.title,
-          url: n.url_pc || n.url_mobile,
-          digest: n.digest,
-          pub_ts: n.pub_ts,
-          pub_time: n.pub_time,
-          showtime: n.showtime,
-          editor: n.editor,
-          publisher: "东方财富",
-          source: "东方财富 7x24h",
-          comment_num: n.comment_num,
-          _channel: "eastmoney",
-          _raw: n,
-        });
-      }
+      try {
+        const d = JSON.parse(emRaw);
+        for (const n of d.news || []) {
+          items.push({
+            channel: "eastmoney",
+            title: n.title,
+            url: n.url_pc || n.url_mobile || null,
+            digest: n.digest || null,
+            pub_ts: n.pub_ts || null,
+            pub_time: n.pub_time || null,
+            showtime: n.showtime || null,
+            editor: n.editor || null,
+            publisher: "东方财富",
+            comment_num: n.comment_num || 0,
+          });
+        }
+      } catch {}
     }
     items.sort((a, b) => (b.pub_ts || 0) - (a.pub_ts || 0));
-    const limit = parseInt(params.get("limit") || "0", 10);
-    merged.merged = limit > 0 ? items.slice(0, limit) : items;
-    merged.merged_count = merged.merged.length;
-    return json(merged);
+    const page = items.slice(0, limit);
+    return json({
+      total: items.length,
+      count: page.length,
+      limit,
+      items: page,
+    });
   }
 
   return error(`Unknown news channel: ${which}`, 400);
