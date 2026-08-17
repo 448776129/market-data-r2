@@ -1048,9 +1048,9 @@ const HOME_HTML = `<!DOCTYPE html>
     <div class="ep"><div class="m">GET /price</div><div class="d">实时价格（当场调取 Yahoo API，含涨跌幅/52周高低，非数据库缓存）</div><div class="ex">/price?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（体积小，可离线分析）</div><div class="ex">/download?symbol=AAPL&amp;interval=1h</div></div>
     <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
-    <div class="ep"><div class="m">GET /news</div><div class="d">聚合新闻：雅虎香港头条 + 东方财富 7x24h 合并，按发布时间倒序</div><div class="ex">/news?limit=30</div></div>
-    <div class="ep"><div class="m">GET /news-yh</div><div class="d">雅虎香港财经头条（hk.finance.yahoo.com，繁体中文，约 25 条）</div><div class="ex">/news-yh?limit=10</div></div>
-    <div class="ep"><div class="m">GET /news-em</div><div class="d">东方财富 7x24h 快讯（kuaixun.eastmoney.com，简体中文，80 条）</div><div class="ex">/news-em?limit=20</div></div>
+    <div class="ep"><div class="m">GET /news</div><div class="d">聚合新闻（雅虎 + 东方财富扁平合并），按发布时间倒序，默认 20 条，加 limit 获取更多</div><div class="ex">/news?limit=50</div></div>
+    <div class="ep"><div class="m">GET /news-yh</div><div class="d">雅虎香港财经头条（繁体），默认 20 条，采集端每 5 分钟刷新</div><div class="ex">/news-yh?limit=24</div></div>
+    <div class="ep"><div class="m">GET /news-em</div><div class="d">东方财富 7x24h 快讯（简体），默认 20 条，采集端每 5 分钟刷新</div><div class="ex">/news-em?limit=80</div></div>
     <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
     <div class="ep"><div class="m">GET /indices</div><div class="d">全部可用指数/清单及其成分数量</div><div class="ex">/indices</div></div>
     <div class="ep"><div class="m">GET /symbols</div><div class="d">按区域列出股票代码（支持分页）</div><div class="ex">/symbols?region=cn&amp;limit=10</div></div>
