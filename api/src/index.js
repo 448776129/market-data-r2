@@ -179,15 +179,14 @@ async function edgeCache(key, ttlSec, env, ctx, producer) {
     return origin; // 错误响应不缓存，避免缓存住 404/错误
   }
 
-  // 写缓存：用 TTL 让边缘自动过期
-  const cacheable = new Response(origin.body, origin);
-  cacheable.headers.set("Cache-Control", `public, max-age=${ttlSec}`);
-  ctx.waitUntil(cache.put(cacheKey, cacheable));
+  // 写缓存：clone 一份给 cache.put（body 只能消费一次）
+  const forCache = origin.clone();
+  forCache.headers.set("Cache-Control", `public, max-age=${ttlSec}`);
+  ctx.waitUntil(cache.put(cacheKey, forCache));
 
-  const resp = new Response(origin.body, origin);
-  resp.headers.set("Cache-Control", `public, max-age=${Math.min(ttlSec, 60)}`);
-  resp.headers.set("CF-Cache-Status", "MISS");
-  return resp;
+  origin.headers.set("Cache-Control", `public, max-age=${Math.min(ttlSec, 60)}`);
+  origin.headers.set("CF-Cache-Status", "MISS");
+  return origin;
 }
 
 // 读取静态清单（universe）：优先 KV（毫秒级、不耗 R2 读额度），miss 时 fallback R2。

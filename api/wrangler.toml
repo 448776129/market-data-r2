@@ -33,7 +33,7 @@ bucket_name = "stocksmarkets"
 # 然后将返回的 id 填入下方 id 字段。
 [[kv_namespaces]]
 binding = "STATIC_KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "c52b429797514cc49a16b2d7722549d4"
 
 [observability]
 enabled = true
