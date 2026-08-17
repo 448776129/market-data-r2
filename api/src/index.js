@@ -739,8 +739,23 @@ async function handleAggNews(which, params, env) {
   const userLimit = parseInt(params.get("limit") || "0", 10);
   const limit = userLimit > 0 ? userLimit : DEFAULT_NEWS_LIMIT;
 
+  // 直连 KV（新闻是小 JSON，KV 读几乎免费 + 低延迟），KV 没有再回退 R2。
+  // 这样命中时完全不走 R2 binding → R2 Class B 为 0，Worker CPU 更低。
+  async function loadNews(name /* yh | em */) {
+    // 先 KV
+    if (env.STATIC_KV) {
+      try {
+        const kvText = await env.STATIC_KV.get(`news:${name}`);
+        if (typeof kvText === "string" && kvText.length > 0) {
+          return kvText;
+        }
+      } catch {}
+    }
+    return fetchUpstream(`news/${name}.json`, env);
+  }
+
   if (["yh", "em"].includes(which)) {
-    const text = await fetchUpstream(`news/${which}.json`, env);
+    const text = await loadNews(which);
     if (text === null) {
       return error(`暂未采集到${which === "yh" ? "雅虎香港" : "东方财富"}新闻。news/${which}.json 未入库。`, 404);
     }
@@ -760,8 +775,8 @@ async function handleAggNews(which, params, env) {
 
   if (which === "all") {
     const [yhRaw, emRaw] = await Promise.all([
-      fetchUpstream("news/yh.json", env),
-      fetchUpstream("news/em.json", env),
+      loadNews("yh"),
+      loadNews("em"),
     ]);
 
     const items = [];
@@ -1194,6 +1209,74 @@ const HOME_HTML = `<!DOCTYPE html>
         <tr><td><code>splits</code></td><td>array</td><td>拆股记录（若已入库）</td><td>是</td></tr>
         <tr><td><code>recommendations_summary</code></td><td>array</td><td>分析师评级汇总（若已入库）</td><td>是</td></tr>
         <tr><td><code>major_holders / institutional_holders</code></td><td>array</td><td>大股东 / 机构持股（若已入库）</td><td>是</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="fsub">四、新闻接口 <span class="tag">GET /news · /news-yh · /news-em</span></h3>
+  <div class="fcard" style="margin-top:10px;margin-bottom:16px">
+    <ul>
+      <li><span class="k">通用外层</span><span class="d"><code>{ total, count, limit, items: [...] }</code>，默认 <code>limit=20</code>，用 <code>?limit=N</code> 取更多</span></li>
+      <li><span class="k">采集频率</span><span class="d">GitHub Actions 每 5 分钟刷新一次 R2 中的 <code>news/yh.json</code> 与 <code>news/em.json</code></span></li>
+      <li><span class="k">边缘缓存</span><span class="d">/news 30s /news-yh 60s /news-em 30s，命中时不进 Worker、不耗 R2 读</span></li>
+    </ul>
+  </div>
+
+  <h4 class="fsub2">4.1 雅虎香港头条 · <code>items[]</code> 字段（<code>/news-yh</code>）</h4>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>title</code></td><td>string</td><td>新闻标题（繁体中文）</td><td><code>"亞洲股市普遍上漲，日本、中國延續升勢"</code></td><td>否</td></tr>
+        <tr><td><code>url</code></td><td>string</td><td>Yahoo 新闻原文链接（<code>hk.finance.yahoo.com/news/...</code>）</td><td><code>"https://hk.finance.yahoo.com/news/..."</code></td><td>否</td></tr>
+        <tr><td><code>pub_ts</code></td><td>number</td><td>发布时间（Unix 秒）</td><td><code>1786944538</code></td><td>是</td></tr>
+        <tr><td><code>pub_time</code></td><td>string</td><td>发布时间（ISO 8601，已本地化）</td><td><code>"2026-08-17T05:28:58+00:00"</code></td><td>是</td></tr>
+        <tr><td><code>rel_time</code></td><td>string</td><td>相对时间（雅虎原始，繁体中文）</td><td><code>"20分前"</code>/<code>"剛剛"</code>/<code>"昨日"</code></td><td>是</td></tr>
+        <tr><td><code>publisher</code></td><td>string</td><td>新闻来源（媒体名）</td><td><code>"Investing.com HK"</code>/<code>"AASTOCKS"</code></td><td>是</td></tr>
+        <tr><td><code>source</code></td><td>string</td><td>固定标识</td><td><code>"Yahoo Finance HK"</code></td><td>否</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4 class="fsub2">4.2 东方财富 7x24h · <code>items[]</code> 字段（<code>/news-em</code>）</h4>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>string</td><td>东方财富新闻 ID</td><td><code>"202608173843023630"</code></td><td>否</td></tr>
+        <tr><td><code>title</code></td><td>string</td><td>新闻标题（简体中文）</td><td><code>"上证指数涨1%"</code></td><td>否</td></tr>
+        <tr><td><code>digest</code></td><td>string</td><td>新闻摘要 / 第一段正文</td><td><code>"上证指数涨幅扩大至1%，深证成指涨1.94%…"</code></td><td>是</td></tr>
+        <tr><td><code>showtime</code></td><td>string</td><td>东方财富显示时间（亚洲/上海时区字符串）</td><td><code>"2026-08-17 13:44:32"</code></td><td>否</td></tr>
+        <tr><td><code>pub_ts</code></td><td>number</td><td>发布时间（Unix 秒）</td><td><code>1786945472</code></td><td>是</td></tr>
+        <tr><td><code>pub_time</code></td><td>string</td><td>发布时间（ISO 8601）</td><td><code>"2026-08-17T05:44:32+00:00"</code></td><td>是</td></tr>
+        <tr><td><code>url_pc</code></td><td>string</td><td>东方财富 PC 版原文链接</td><td><code>"http://finance.eastmoney.com/a/..."</code></td><td>是</td></tr>
+        <tr><td><code>url_mobile</code></td><td>string</td><td>东方财富 移动版原文链接</td><td><code>"https://wap.eastmoney.com/a/..."</code></td><td>是</td></tr>
+        <tr><td><code>image</code></td><td>string</td><td>封面图 URL</td><td><code>"https://..."</code></td><td>是</td></tr>
+        <tr><td><code>editor</code></td><td>string</td><td>编辑名</td><td><code>"编辑A"</code></td><td>是</td></tr>
+        <tr><td><code>columns</code></td><td>array[string]</td><td>东方财富栏目编号</td><td><code>["100","102","104"]</code></td><td>是</td></tr>
+        <tr><td><code>comment_num</code></td><td>number</td><td>评论数</td><td><code>7</code></td><td>是</td></tr>
+        <tr><td><code>news_type</code></td><td>string</td><td>新闻类型编号</td><td><code>"1"</code></td><td>是</td></tr>
+        <tr><td><code>source</code></td><td>string</td><td>固定标识</td><td><code>"东方财富 7x24h"</code></td><td>否</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4 class="fsub2">4.3 聚合新闻 · <code>items[]</code> 字段（<code>/news</code>）</h4>
+  <div class="ftable">
+    <table>
+      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
+      <tbody>
+        <tr><td><code>channel</code></td><td>string</td><td>来源通道</td><td><code>"eastmoney"</code> 或 <code>"yahoo_hk"</code></td><td>否</td></tr>
+        <tr><td><code>title</code></td><td>string</td><td>标题</td><td>—</td><td>否</td></tr>
+        <tr><td><code>url</code></td><td>string</td><td>原文链接（yahoo 直链 / eastmoney 优先 PC 版）</td><td>—</td><td>否</td></tr>
+        <tr><td><code>digest</code></td><td>string</td><td>摘要（eastmoney 有；yahoo_hk 为 <code>null</code>）</td><td>—</td><td>是</td></tr>
+        <tr><td><code>pub_ts</code></td><td>number</td><td>发布时间（Unix 秒），聚合列表按此字段倒序</td><td>—</td><td>是</td></tr>
+        <tr><td><code>pub_time</code></td><td>string</td><td>发布时间（ISO 8601）</td><td>—</td><td>是</td></tr>
+        <tr><td><code>showtime</code></td><td>string</td><td>东方财富显示时间（yahoo_hk 为 <code>null</code>）</td><td><code>"2026-08-17 13:44:32"</code></td><td>是</td></tr>
+        <tr><td><code>rel_time</code></td><td>string</td><td>雅虎相对时间（eastmoney 无此字段）</td><td><code>"20分前"</code></td><td>是</td></tr>
+        <tr><td><code>publisher</code></td><td>string</td><td>媒体来源；eastmoney 固定 <code>"东方财富"</code></td><td>—</td><td>是</td></tr>
+        <tr><td><code>editor</code></td><td>string</td><td>编辑；仅 eastmoney 有</td><td>—</td><td>是</td></tr>
+        <tr><td><code>comment_num</code></td><td>number</td><td>评论数；仅 eastmoney 有</td><td><code>7</code></td><td>是</td></tr>
       </tbody>
     </table>
   </div>

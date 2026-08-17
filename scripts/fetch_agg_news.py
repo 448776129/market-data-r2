@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(__file__))
 
 import r2store
+import kvstore  # 采集侧双写到 KV：读更省 Worker 配额，KV 读免费 + 低延迟
 
 PROXY = "https://img2.365200.xyz"
 HEADERS = {
@@ -316,8 +317,10 @@ def _fingerprint(data: dict) -> str:
 
 
 def write_if_changed(key: str, data: dict) -> bool:
-    """和上一次指纹比对，相同就跳过写入（省 R2 Class A）。
-    状态存在 R2 自身同一对象的元数据对比无法获取，改用 _state/news_{name}.fp 文件存 MD5。
+    """R2 写入口：指纹相同跳过 → 否则双写 R2 + KV。
+
+    - R2:  作为最终持久化 + 状态指纹文件（_state/news_*.fp）
+    - KV：  作为 Worker 读入口（KV 读相比 R2 更省 Worker 配额，延迟更低）
     """
     name = key.replace("news/", "").replace(".json", "")
     state_key = f"_state/news_{name}.fp"
@@ -335,7 +338,14 @@ def write_if_changed(key: str, data: dict) -> bool:
     payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
     r2store.put_bytes(key, payload, content_type="application/json; charset=utf-8")
     r2store.put_bytes(state_key, new_fp.encode("ascii"), content_type="text/plain; charset=utf-8")
-    print(f"  [write] {key}: {len(payload)//1024} KB, 指纹 {old_fp[:10] if old_fp else 'null'} -> {new_fp[:10]}")
+
+    # 同步 KV：Worker 读优先走 KV，省 R2 Class B + Worker CPU。
+    # KV 凭据缺失时静默跳过，不影响主流程（Worker 会回退读 R2）。
+    kv_key = f"news:{name}"  # news:yh / news:em
+    kv_ok = kvstore.put_bytes(kv_key, payload, content_type="application/json; charset=utf-8")
+    kv_str = f" KV→{'ok' if kv_ok else 'skip'}"
+
+    print(f"  [write] {key}: {len(payload)//1024} KB, 指纹 {old_fp[:10] if old_fp else 'null'} -> {new_fp[:10]}{kv_str}")
     return True
 
 

@@ -81,6 +81,32 @@ def put(key: str, value: str) -> bool:
         return False
 
 
+def put_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+    """写入一个 KV 键值，字节形式（支持 JSON/任意二进制）。"""
+    if not (_env("CLOUDFLARE_API_TOKEN") and _env("CLOUDFLARE_ACCOUNT_ID") and _env("KV_NAMESPACE_ID")):
+        return False
+    url = f"{_api_base()}/{_namespace_id()}/values/{urllib.parse.quote(key, safe='')}"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {_token()}",
+            "Content-Type": content_type,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = _json.loads(resp.read().decode("utf-8"))
+            if not body.get("success"):
+                print(f"  [KV] 写入失败 {key}: {body.get('errors')}", flush=True)
+                return False
+            return True
+    except Exception as exc:  # noqa: BLE001 - KV 写失败不中断，R2 保底
+        print(f"  [KV] 写入异常 {key}: {exc!r}", flush=True)
+        return False
+
+
 def put_universe(name: str, csv_text: str) -> bool:
     """写入股票清单到 KV。
 
