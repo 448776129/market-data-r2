@@ -360,34 +360,6 @@ async function handleKline(params, env) {
 }
 
 // ============================================================
-// 新闻（从 R2 {region}/news/{symbol}.json 读取）
-// ============================================================
-async function handleNews(params, env) {
-  const symbol = (params.get("symbol") || "").trim().toUpperCase();
-  if (!symbol) {
-    return json({
-      usage: {
-        endpoint: `${API_BASE}/news`,
-        description: "查询个股相关新闻（采集端经 Yahoo search 采集入库）",
-        params: { symbol: "股票代码（必填）" },
-        example: `${API_BASE}/news?symbol=AAPL`,
-      },
-    });
-  }
-  const region = (params.get("region") || inferRegion(symbol)).toLowerCase();
-  const text = await fetchWithFallback(`data/${region}/news/${symbol}.json`, env);
-  if (text === null) {
-    return error(`No news for ${symbol}. File not found: data/${region}/news/${symbol}.json`, 404);
-  }
-  try {
-    const data = JSON.parse(text);
-    return json(data);
-  } catch {
-    return error(`Invalid news JSON for ${symbol}`, 502);
-  }
-}
-
-// ============================================================
 // 个股元数据（quote）
 // ============================================================
 async function handleQuote(params, env) {
@@ -745,7 +717,6 @@ function handleStatus(request) {
       price: `${API_BASE}/price`,
       download: `${API_BASE}/download`,
       quote: `${API_BASE}/quote`,
-      news: `${API_BASE}/news`,
       universe: `${API_BASE}/universe`,
       indices: `${API_BASE}/indices`,
       symbols: `${API_BASE}/symbols`,
@@ -962,7 +933,6 @@ const HOME_HTML = `<!DOCTYPE html>
     <div class="ep"><div class="m">GET /price</div><div class="d">实时价格（当场调取 Yahoo API，含涨跌幅/52周高低，非数据库缓存）</div><div class="ex">/price?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（体积小，可离线分析）</div><div class="ex">/download?symbol=AAPL&amp;interval=1h</div></div>
     <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
-    <div class="ep"><div class="m">GET /news</div><div class="d">个股相关新闻（标题/来源/时间，采集端入库）</div><div class="ex">/news?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
     <div class="ep"><div class="m">GET /indices</div><div class="d">全部可用指数/清单及其成分数量</div><div class="ex">/indices</div></div>
     <div class="ep"><div class="m">GET /symbols</div><div class="d">按区域列出股票代码（支持分页）</div><div class="ex">/symbols?region=cn&amp;limit=10</div></div>
@@ -1110,25 +1080,6 @@ const HOME_HTML = `<!DOCTYPE html>
     </table>
   </div>
 
-  <h3 class="fsub">四、新闻 <span class="tag">GET /news</span></h3>
-  <div class="ftable">
-    <table>
-      <thead><tr><th>字段</th><th>类型</th><th>描述</th><th>示例</th><th>可空</th></tr></thead>
-      <tbody>
-        <tr><td><code>symbol</code></td><td>string</td><td>股票代码</td><td><code>"AAPL"</code></td><td>否</td></tr>
-        <tr><td><code>news[]</code></td><td>array</td><td>新闻数组</td><td><code>[...]</code></td><td>否</td></tr>
-        <tr><td><code>news[].title</code></td><td>string</td><td>新闻标题</td><td><code>"Apple earnings beat"</code></td><td>否</td></tr>
-        <tr><td><code>news[].publisher</code></td><td>string</td><td>新闻来源</td><td><code>"Reuters"</code></td><td>是</td></tr>
-        <tr><td><code>news[].providerPublishTime</code></td><td>number</td><td>发布时间（Unix 秒）</td><td><code>1786824538</code></td><td>是</td></tr>
-        <tr><td><code>news[].link</code></td><td>string</td><td>新闻链接</td><td><code>"https://..."</code></td><td>是</td></tr>
-        <tr><td><code>news[].type</code></td><td>string</td><td>内容类型（STORY 等）</td><td><code>"STORY"</code></td><td>是</td></tr>
-        <tr><td><code>news[].relatedTickers</code></td><td>array</td><td>关联股票代码</td><td><code>["AAPL"]</code></td><td>是</td></tr>
-        <tr><td><code>quote</code></td><td>object</td><td>关联行情快照（板块/行业等）</td><td><code>{...}</code></td><td>是</td></tr>
-        <tr><td><code>collected_at</code></td><td>string</td><td>采集时间（ISO）</td><td><code>"2026-08-16T11:00:00Z"</code></td><td>否</td></tr>
-      </tbody>
-    </table>
-  </div>
-
   <div class="fcard" style="margin-top:18px">
     <h3>K线时间范围与数据说明</h3>
     <ul>
@@ -1213,7 +1164,6 @@ const HOME_HTML = `<!DOCTYPE html>
 const CACHE_TTL = {
   index: 300, // 首页（纯静态文档）
   kline: 60,
-  news: 300,
   quote: 300,
   universe: 300,
   indices: 300,
@@ -1244,8 +1194,6 @@ export default {
         edgeCache(url.href, ttl, env, ctx, () => handleKline(params, env)),
       "/quote": (ttl) =>
         edgeCache(url.href, ttl, env, ctx, () => handleQuote(params, env)),
-      "/news": (ttl) =>
-        edgeCache(url.href, ttl, env, ctx, () => handleNews(params, env)),
       "/price": (ttl) =>
         edgeCache(url.href, ttl, env, ctx, () => handlePrice(params, env)),
       "/download": (ttl) =>
@@ -1265,7 +1213,7 @@ export default {
     }
 
     return error(
-      "Not found. Use /, /kline, /price, /download, /quote, /news, /universe, /indices, /symbols, /status",
+      "Not found. Use /, /kline, /price, /download, /quote, /universe, /indices, /symbols, /status",
       404
     );
   },
