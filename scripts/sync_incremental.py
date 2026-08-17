@@ -65,7 +65,11 @@ def key_for(region: str, symbol: str, interval: str) -> str:
 
 
 def load_existing(region: str, symbol: str, interval: str, index_col: str) -> pd.DataFrame | None:
-    """从 R2 读取该股票该周期已有数据（自动解压 gzip）。"""
+    """从 R2 读取该股票该周期已有数据（自动解压 gzip）。
+
+    **只在绝对需要时调用**：每调用一次就是一次 R2 Class B 读。
+    若调用方知道 fresh 的所有行都严格晚于已有数据，应直接走「直接覆盖写入」路径。
+    """
     text = r2store.get_csv_text(key_for(region, symbol, interval))
     if text is None:
         return None
@@ -78,28 +82,57 @@ def load_existing(region: str, symbol: str, interval: str, index_col: str) -> pd
     return df
 
 
+def _normalize_df(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """把 fresh/existing DataFrame 的列和索引统一到约定格式。"""
+    df = df[COLS].copy()
+    df.index = pd.to_datetime(df.index)
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    if interval == "1d":
+        df.index = df.index.normalize()
+    return df
+
+
 def merge_and_upload(
-    region: str, symbol: str, interval: str, fresh: pd.DataFrame
+    region: str, symbol: str, interval: str, fresh: pd.DataFrame,
+    known_last_ts: pd.Timestamp | None = None,
 ) -> tuple[int, pd.DataFrame]:
     """与 R2 已有数据合并去重后写回。
 
+    Args:
+        region, symbol, interval: 定位对象
+        fresh: 本次拉到的新数据
+        known_last_ts: 状态清单中记录的、R2 已存的最后时间。
+            若已知且 fresh 的首行严格晚于它 → 说明 fresh 完全是新增数据，
+            **不必读 R2**，直接写 fresh 本身即可（省一次 R2 读）。
+            为 None 或 有重叠风险（例如 buffer 回看）时，退回读 R2 合并。
+
     返回 (新增行数, 合并后的完整 DataFrame)。
-    这里仍然需要读一次 R2 已存在对象做合并，但只在「真正拉到了新数据」时才发生，
-    不再对每只股票每次运行都读全文件去判断是否需要增量。
     """
     index_col = DATE_COL if interval == "1d" else DT_COL
+    fresh = _normalize_df(fresh, interval)
+
+    # ---- 快速路径：已知最后时间，且 fresh 完全在其之后 → 不必读 R2 ----
+    if known_last_ts is not None and not fresh.empty:
+        fresh_min = fresh.index.min()
+        # 1d：日级别直接按天比即可
+        # 分钟周期：要求 fresh 首行严格大于 known_last_ts
+        if interval == "1d":
+            no_overlap = fresh_min.date() > known_last_ts.date()
+        else:
+            no_overlap = fresh_min > known_last_ts
+        if no_overlap:
+            # 直接覆盖写入：fresh 本身就是完整新增
+            csv_text = fresh.to_csv()
+            r2store.put_csv(key_for(region, symbol, interval), csv_text)
+            return len(fresh), fresh
+
+    # ---- 常规路径：读 R2 已有数据做合并（仅在可能重叠时走这里）----
     existing = load_existing(region, symbol, interval, index_col)
-
-    fresh = fresh[COLS].copy()
-    fresh.index = pd.to_datetime(fresh.index)
-    if getattr(fresh.index, "tz", None) is not None:
-        fresh.index = fresh.index.tz_localize(None)
-    if index_col == DATE_COL:
-        fresh.index = fresh.index.normalize()
-
     if existing is None or existing.empty:
         merged = fresh
     else:
+        existing = _normalize_df(existing, interval)
         merged = pd.concat([existing, fresh])
         merged = merged[~merged.index.duplicated(keep="last")].sort_index()
 
@@ -177,7 +210,7 @@ def fetch_incremental(
 
     if fresh is None or fresh.empty:
         return 0, None
-    added, merged = merge_and_upload(region, symbol, interval, fresh)
+    added, merged = merge_and_upload(region, symbol, interval, fresh, known_last_ts=prev_ts)
     if merged is None or merged.empty:
         return added, None
     return added, merged.index.max()
@@ -196,6 +229,8 @@ def sync_minute_and_derived(
     """拉取 1m + 1h 增量，并由 1m 增量重采样合并 5m/15m/30m。
 
     通过 entry（状态清单中该股票条目）记录各周期最后时间，返回新增行数。
+    优化：1m 重采样得到的 5m/15m/30m 派生结果，若完全在 state 记录之后，
+         直接追加写入，不必读 R2 旧数据；否则才退回读 R2 合并。
     """
     added = 0
     for interval in SOURCE_INTERVALS:
@@ -208,32 +243,45 @@ def sync_minute_and_derived(
     if added <= 0:
         return 0
 
-    # 由 1m 增量合并后的数据重采样派生 5m/15m/30m
+    # 读一次 1m 完整数据用于重采样派生（1m 数据本身就是刚合并完的，
+    # 这里无法完全避免；但 4 个派生周期可以共用这一次 1m 读）
     m1 = load_existing(region, symbol, "1m", DT_COL)
-    if m1 is not None and not m1.empty:
-        for target, rule in config.INTRADAY_DERIVED.items():
-            agg = m1.resample(rule).agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-            )
-            agg = agg.dropna(subset=["Close"])
-            if agg.empty:
-                continue
-            agg["Adj Close"] = m1["Close"].resample(rule).last()
-            agg = agg[COLS]
-            # 与已有合并去重
-            index_col = DT_COL
-            existing = load_existing(region, symbol, target, index_col)
-            agg.index = pd.to_datetime(agg.index)
-            if existing is None or existing.empty:
-                merged = agg
-            else:
-                merged = pd.concat([existing, agg])
-                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-            before = len(existing) if existing is not None else 0
-            if len(merged) > before:
-                r2store.put_csv(key_for(region, symbol, target), merged.to_csv())
-                added += len(merged) - before
-                entry[target] = _fmt(merged.index.max(), target)
+    if m1 is None or m1.empty:
+        return added
+    m1 = _normalize_df(m1, "1m")
+
+    for target, rule in config.INTRADAY_DERIVED.items():
+        agg = m1.resample(rule).agg(
+            {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+        )
+        agg = agg.dropna(subset=["Close"])
+        if agg.empty:
+            continue
+        agg["Adj Close"] = m1["Close"].resample(rule).last()
+        agg = agg[COLS]
+        agg.index = pd.to_datetime(agg.index)
+        # 派生周期的快速路径：完全在已知最后时间之后 → 不必读 R2
+        known_last = _ts(entry.get(target))
+        if known_last is not None and agg.index.min() > known_last:
+            csv_text = agg.to_csv()
+            r2store.put_csv(key_for(region, symbol, target), csv_text)
+            added += len(agg)
+            entry[target] = _fmt(agg.index.max(), target)
+            continue
+        # 常规路径：读 R2 已有派生数据做合并去重
+        index_col = DT_COL
+        existing = load_existing(region, symbol, target, index_col)
+        if existing is None or existing.empty:
+            merged = agg
+        else:
+            existing = _normalize_df(existing, target)
+            merged = pd.concat([existing, agg])
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        before = len(existing) if existing is not None else 0
+        if len(merged) > before:
+            r2store.put_csv(key_for(region, symbol, target), merged.to_csv())
+            added += len(merged) - before
+            entry[target] = _fmt(merged.index.max(), target)
     return added
 
 
@@ -303,6 +351,7 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
                     if new_entry and new_entry != snap.get(sym):
                         snap[sym] = new_entry
                         reg_changed += 1
+                        changed_symbols += 1
                 if done % 25 == 0 or done == len(symbols):
                     print(
                         f"  [{done}/{len(symbols)}] {reg} 已处理，累计新增 {total_added} 行，失败 {len(failed)}",
