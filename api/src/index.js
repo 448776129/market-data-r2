@@ -703,6 +703,110 @@ async function handleSymbols(params, env) {
 }
 
 // ============================================================
+// 聚合新闻
+// ============================================================
+async function handleAggNews(which, params, env) {
+  // 支持 ?help=1 返回文档
+  if (params.get("help") === "1") {
+    return json({
+      endpoints: {
+        "/news-yh": {
+          description: "雅虎香港财经头条（hk.finance.yahoo.com/topic/latest-news/），约 20-25 条，中文繁体。每 5 分钟自动采集。",
+          source_url: "https://hk.finance.yahoo.com/topic/latest-news/",
+          params: { limit: "可选：最多返回条数，默认返回采集的全部" },
+          example: `${API_BASE}/news-yh?limit=10`,
+        },
+        "/news-em": {
+          description: "东方财富 7x24h 财经快讯（kuaixun.eastmoney.com），每次入库 80 条，中文简体。每 5 分钟自动采集。",
+          source_url: "https://kuaixun.eastmoney.com/",
+          params: { limit: "可选：最多返回条数" },
+          example: `${API_BASE}/news-em?limit=20`,
+        },
+        "/news": {
+          description: "聚合新闻：雅虎香港头条 + 东方财富 7x24h 合并，按发布时间倒序。返回 各源原始结构 + merged 扁平列表。",
+          params: { limit: "可选：merged 列表最多返回条数" },
+          example: `${API_BASE}/news?limit=30`,
+        },
+      },
+    });
+  }
+
+  if (["yh", "em"].includes(which)) {
+    const text = await fetchUpstream(`news/${which}.json`, env);
+    if (text === null) {
+      return error(`暂未采集到${which === "yh" ? "雅虎香港" : "东方财富"}新闻。news/${which}.json 未入库。`, 404);
+    }
+    try {
+      const data = JSON.parse(text);
+      const limit = parseInt(params.get("limit") || "0", 10);
+      if (limit > 0 && Array.isArray(data.news)) {
+        data.news = data.news.slice(0, limit);
+        data.count = data.news.length;
+      }
+      return json(data);
+    } catch {
+      return error(`news/${which}.json 解析失败`, 502);
+    }
+  }
+
+  if (which === "all") {
+    const [yhRaw, emRaw] = await Promise.all([
+      fetchUpstream("news/yh.json", env),
+      fetchUpstream("news/em.json", env),
+    ]);
+    const merged = {
+      endpoint: `${API_BASE}/news`,
+      description: "聚合新闻：雅虎香港头条 + 东方财富 7x24h 快讯，按发布时间倒序。",
+      fetched_at: new Date().toISOString(),
+      available: {
+        yahoo_hk: yhRaw !== null,
+        eastmoney: emRaw !== null,
+      },
+      yahoo_hk: yhRaw ? JSON.parse(yhRaw) : null,
+      eastmoney: emRaw ? JSON.parse(emRaw) : null,
+    };
+
+    // 合并成扁平列表
+    const items = [];
+    if (yhRaw) {
+      const d = JSON.parse(yhRaw);
+      for (const n of d.news || []) {
+        items.push({
+          ...n,
+          _channel: "yahoo_hk",
+        });
+      }
+    }
+    if (emRaw) {
+      const d = JSON.parse(emRaw);
+      for (const n of d.news || []) {
+        items.push({
+          title: n.title,
+          url: n.url_pc || n.url_mobile,
+          digest: n.digest,
+          pub_ts: n.pub_ts,
+          pub_time: n.pub_time,
+          showtime: n.showtime,
+          editor: n.editor,
+          publisher: "东方财富",
+          source: "东方财富 7x24h",
+          comment_num: n.comment_num,
+          _channel: "eastmoney",
+          _raw: n,
+        });
+      }
+    }
+    items.sort((a, b) => (b.pub_ts || 0) - (a.pub_ts || 0));
+    const limit = parseInt(params.get("limit") || "0", 10);
+    merged.merged = limit > 0 ? items.slice(0, limit) : items;
+    merged.merged_count = merged.merged.length;
+    return json(merged);
+  }
+
+  return error(`Unknown news channel: ${which}`, 400);
+}
+
+// ============================================================
 // 状态
 // ============================================================
 function handleStatus(request) {
@@ -717,6 +821,9 @@ function handleStatus(request) {
       price: `${API_BASE}/price`,
       download: `${API_BASE}/download`,
       quote: `${API_BASE}/quote`,
+      news: `${API_BASE}/news`,
+      "news-yh": `${API_BASE}/news-yh`,
+      "news-em": `${API_BASE}/news-em`,
       universe: `${API_BASE}/universe`,
       indices: `${API_BASE}/indices`,
       symbols: `${API_BASE}/symbols`,
@@ -933,6 +1040,9 @@ const HOME_HTML = `<!DOCTYPE html>
     <div class="ep"><div class="m">GET /price</div><div class="d">实时价格（当场调取 Yahoo API，含涨跌幅/52周高低，非数据库缓存）</div><div class="ex">/price?symbol=AAPL</div></div>
     <div class="ep"><div class="m">GET /download</div><div class="d">下载 gzip 压缩的原始 CSV（体积小，可离线分析）</div><div class="ex">/download?symbol=AAPL&amp;interval=1h</div></div>
     <div class="ep"><div class="m">GET /quote</div><div class="d">个股元数据（名称/行业/市值/最新价/52周高低…）</div><div class="ex">/quote?symbol=600519.SS</div></div>
+    <div class="ep"><div class="m">GET /news</div><div class="d">聚合新闻：雅虎香港头条 + 东方财富 7x24h 合并，按发布时间倒序</div><div class="ex">/news?limit=30</div></div>
+    <div class="ep"><div class="m">GET /news-yh</div><div class="d">雅虎香港财经头条（hk.finance.yahoo.com，繁体中文，约 25 条）</div><div class="ex">/news-yh?limit=10</div></div>
+    <div class="ep"><div class="m">GET /news-em</div><div class="d">东方财富 7x24h 快讯（kuaixun.eastmoney.com，简体中文，80 条）</div><div class="ex">/news-em?limit=20</div></div>
     <div class="ep"><div class="m">GET /universe</div><div class="d">指数成分股清单（csi300/csi500/nasdaq100/sp500/hsi）</div><div class="ex">/universe?index=csi300</div></div>
     <div class="ep"><div class="m">GET /indices</div><div class="d">全部可用指数/清单及其成分数量</div><div class="ex">/indices</div></div>
     <div class="ep"><div class="m">GET /symbols</div><div class="d">按区域列出股票代码（支持分页）</div><div class="ex">/symbols?region=cn&amp;limit=10</div></div>
@@ -1170,6 +1280,9 @@ const CACHE_TTL = {
   symbols: 300,
   download: 60,
   price: 15, // 实时：只缓 15s，避免每次都打 Yahoo/耗 Worker
+  "news-yh": 60, // Yahoo HK 头条：每 5 分钟采集，缓存 60s
+  "news-em": 30, // 东方财富 7x24h：每 5 分钟采集但内容更新快，缓存 30s
+  "news-all": 30,
 };
 
 export default {
@@ -1205,6 +1318,12 @@ export default {
       "/symbols": (ttl) =>
         edgeCache(url.href, ttl, env, ctx, () => handleSymbols(params, env)),
       "/status": () => handleStatus(request),
+      "/news-yh": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleAggNews("yh", params, env)),
+      "/news-em": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleAggNews("em", params, env)),
+      "/news": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleAggNews("all", params, env)),
     };
 
     const task = routes[path];
@@ -1213,7 +1332,7 @@ export default {
     }
 
     return error(
-      "Not found. Use /, /kline, /price, /download, /quote, /universe, /indices, /symbols, /status",
+      "Not found. Use /, /kline, /price, /download, /quote, /news, /news-yh, /news-em, /universe, /indices, /symbols, /status",
       404
     );
   },
