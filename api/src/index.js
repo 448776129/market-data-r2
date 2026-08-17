@@ -153,6 +153,43 @@ function html(text, status = 200) {
   });
 }
 
+// 边缘缓存（Cloudflare Cache API）：把高频读的 JSON/CSV 接口结果缓存在边缘，
+// 命中时直接短路返回，既省 Worker 的 CPU/请求额度，也大幅减少对 R2 的读操作
+// （每次未命中才回源 R2 一次，命中则零 R2 成本）。
+//
+// key   ：显式缓存键，通常用请求 URL。会附加一个用户不可见的版本前缀便于整体失效。
+// ttlSec：缓存有效期（秒）。过期后自动回源刷新。
+// producer：生成新鲜响应的函数，仅首次/过期时才被调用。
+async function edgeCache(key, ttlSec, env, ctx, producer) {
+  const cache = caches.default;
+  const cacheKey = new Request(key, { method: "GET" });
+
+  // 命中缓存：直接返回，不计 Worker 业务逻辑、不读 R2
+  const hit = await cache.match(cacheKey);
+  if (hit) {
+    // 刷新浏览器端缓存指令，保持对外表现一致
+    const resp = new Response(hit.body, hit);
+    resp.headers.set("Cache-Control", `public, max-age=${Math.min(ttlSec, 60)}`);
+    resp.headers.set("CF-Cache-Status", "HIT");
+    return resp;
+  }
+
+  const origin = await producer();
+  if (origin.status >= 400) {
+    return origin; // 错误响应不缓存，避免缓存住 404/错误
+  }
+
+  // 写缓存：用 TTL 让边缘自动过期
+  const cacheable = new Response(origin.body, origin);
+  cacheable.headers.set("Cache-Control", `public, max-age=${ttlSec}`);
+  ctx.waitUntil(cache.put(cacheKey, cacheable));
+
+  const resp = new Response(origin.body, origin);
+  resp.headers.set("Cache-Control", `public, max-age=${Math.min(ttlSec, 60)}`);
+  resp.headers.set("CF-Cache-Status", "MISS");
+  return resp;
+}
+
 // 读取数据：优先从 R2（MARKET_DATA_R2 binding）读取，失败时 fallback 到 GitHub raw。
 // path 形如 "data/{region}/kline/{symbol}.csv"，R2 中对象键为 "{region}/kline/{symbol}.csv"。
 // R2 中的 K 线 CSV 为 gzip 压缩存储（.gz 或 Content-Encoding: gzip），自动解压。
@@ -1153,6 +1190,22 @@ const HOME_HTML = `<!DOCTYPE html>
 // ============================================================
 // 入口
 // ============================================================
+// 各接口的边缘缓存 TTL（秒）。
+// 历史数据（kline）只会在新数据入库后变化，60s 内可安全命中边缘缓存；
+// 元数据/新闻/清单变动更慢，给更长的 TTL 以最大化省额度；
+// price 是实时 YAHOO 数据，用最短的 15s 平衡"实时"与省额度。
+const CACHE_TTL = {
+  index: 300, // 首页（纯静态文档）
+  kline: 60,
+  news: 300,
+  quote: 300,
+  universe: 300,
+  indices: 300,
+  symbols: 300,
+  download: 60,
+  price: 15, // 实时：只缓 15s，避免每次都打 Yahoo/耗 Worker
+};
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1164,36 +1217,40 @@ export default {
 
     // 首页
     if (path === "/" || path === "") {
-      return html(HOME_HTML);
+      return edgeCache(url.href, CACHE_TTL.index, env, ctx, () => html(HOME_HTML));
     }
 
     const params = url.searchParams;
 
-    // 路由分发
-    switch (path) {
-      case "/kline":
-        return await handleKline(params, env);
-      case "/quote":
-        return await handleQuote(params, env);
-      case "/news":
-        return await handleNews(params, env);
-      case "/price":
-        return await handlePrice(params, env);
-      case "/download":
-        return await handleDownload(params, env);
-      case "/universe":
-        return await handleUniverse(params, env);
-      case "/indices":
-        return await handleIndices(env);
-      case "/symbols":
-        return await handleSymbols(params, env);
-      case "/status":
-        return handleStatus(request);
-      default:
-        return error(
-          "Not found. Use /, /kline, /price, /download, /quote, /news, /universe, /indices, /symbols, /status",
-          404
-        );
+    // 路由分发：除价格外全部缓存到边缘，命中即短路，不读 R2、不耗 CPU
+    const routes = {
+      "/kline": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleKline(params, env)),
+      "/quote": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleQuote(params, env)),
+      "/news": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleNews(params, env)),
+      "/price": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handlePrice(params, env)),
+      "/download": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleDownload(params, env)),
+      "/universe": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleUniverse(params, env)),
+      "/indices": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleIndices(env)),
+      "/symbols": (ttl) =>
+        edgeCache(url.href, ttl, env, ctx, () => handleSymbols(params, env)),
+      "/status": () => handleStatus(request),
+    };
+
+    const task = routes[path];
+    if (task) {
+      return await task(CACHE_TTL[path.slice(1)] ?? CACHE_TTL.index);
     }
+
+    return error(
+      "Not found. Use /, /kline, /price, /download, /quote, /news, /universe, /indices, /symbols, /status",
+      404
+    );
   },
 };

@@ -16,5 +16,14 @@ compatibility_date = "2024-01-01"
 binding = "MARKET_DATA_R2"
 bucket_name = "stocksmarkets"
 
+# 边缘缓存：Worker 通过 Cache API（caches.default）将高频接口结果缓存在边缘，
+# 命中时短路返回，不执行业务逻辑、不读 R2。有效降低 Worker CPU/请求额度与 R2 读次数。
+# - kline / quote / news / universe / indices / symbols / download：TTL 见 src/index.js CACHE_TTL
+#   （历史数据 60s，元数据/清单 300s）
+# - price（实时）：只缓存 15s，平衡实时性与额度
+# - 无需在此额外配置缓存规则，TTL 由代码里的 Cache-Control 控制；
+#   如需对自定义域开启更强 CDN 层缓存，可在面板 Cache Rules 中添加：
+#     stockapi.365200.xyz/*kline* 等 按 head，浏览器缓存 0 分钟，边缘缓存 1 分钟
+
 [observability]
 enabled = true

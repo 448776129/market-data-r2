@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT))
 import config  # noqa: E402
 import marketlib  # noqa: E402
 import r2store  # noqa: E402
+import state  # noqa: E402
 import yahoo_chart  # noqa: E402
 
 COLS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -77,8 +78,15 @@ def load_existing(region: str, symbol: str, interval: str, index_col: str) -> pd
     return df
 
 
-def merge_and_upload(region: str, symbol: str, interval: str, fresh: pd.DataFrame) -> int:
-    """与 R2 已有数据合并去重后写回，返回新增行数。"""
+def merge_and_upload(
+    region: str, symbol: str, interval: str, fresh: pd.DataFrame
+) -> tuple[int, pd.DataFrame]:
+    """与 R2 已有数据合并去重后写回。
+
+    返回 (新增行数, 合并后的完整 DataFrame)。
+    这里仍然需要读一次 R2 已存在对象做合并，但只在「真正拉到了新数据」时才发生，
+    不再对每只股票每次运行都读全文件去判断是否需要增量。
+    """
     index_col = DATE_COL if interval == "1d" else DT_COL
     existing = load_existing(region, symbol, interval, index_col)
 
@@ -100,7 +108,7 @@ def merge_and_upload(region: str, symbol: str, interval: str, fresh: pd.DataFram
     if added > 0:
         csv_text = merged.to_csv()
         r2store.put_csv(key_for(region, symbol, interval), csv_text)
-    return max(added, 0)
+    return max(added, 0), merged
 
 
 def utc_now() -> pd.Timestamp:
@@ -108,49 +116,58 @@ def utc_now() -> pd.Timestamp:
     return pd.Timestamp.now(timezone.utc).tz_localize(None)
 
 
-def fetch_incremental(region: str, symbol: str, interval: str) -> int:
-    """拉取单只股票指定周期增量并合并上传，返回新增行数。"""
-    index_col = DATE_COL if interval == "1d" else DT_COL
-    existing = load_existing(region, symbol, interval, index_col)
+def _ts(entry_value: str | None) -> pd.Timestamp | None:
+    """把状态清单里存的最后时间字符串转回 Timestamp；空/损坏返回 None。"""
+    if not entry_value:
+        return None
+    try:
+        return pd.to_datetime(entry_value)
+    except Exception:  # noqa: BLE001 - 状态损坏按未知处理
+        return None
 
+
+def _fmt(ts: pd.Timestamp, interval: str) -> str:
+    """把 Timestamp 转成状态清单里的字符串（1d 只留日期，其余留完整时间）。"""
+    if ts is None:
+        return ""
+    ts = ts.normalize() if interval == "1d" else ts
+    return ts.isoformat()
+
+
+def fetch_incremental(
+    region: str, symbol: str, interval: str, prev_ts: pd.Timestamp | None
+) -> tuple[int, pd.Timestamp | None]:
+    """拉取单只股票指定周期增量并合并上传。
+
+    用状态清单里的最后时间 prev_ts 判增，命中跳过时完全不读 R2；
+    只有确认有新数据、需要合并时才读一次 R2 旧文件。返回 (新增行数, 合并后最后时间)。
+    """
     now_local = marketlib.region_now(region)
     now_utc = utc_now()
 
-    # ---- 增量查重：数据已最新/新鲜则跳过请求，避免重复拉取 ----
-    if existing is not None and not existing.empty:
-        last_ts = existing.index.max()
-        in_session = marketlib.is_market_session(region, now_local)
-
+    # ---- 增量判重：直接用状态清单的最后时间，避免读 R2 全文件 ----
+    if prev_ts is not None:
         if interval == "1d":
-            # 日K：
-            #  - 非交易时段（收盘后/休市）：若已有最近 2 个自然日内数据 → 跳过
-            #    （交易日收盘bar已入库；周末时周五bar视为最新）
-            #  - 交易时段内：总是拉取（保证当日实时bar与收盘bar）
+            in_session = marketlib.is_market_session(region, now_local)
             recent_cutoff = now_local.date() - timedelta(days=2)
-            if not in_session and last_ts.date() >= recent_cutoff:
-                return 0
-            # 精确增量：从最后日期往回看缓冲段
-            start = (last_ts - pd.Timedelta(days=DAILY_BUFFER_DAYS)).date()
+            if not in_session and prev_ts.date() >= recent_cutoff:
+                return 0, None
+            start = (prev_ts - pd.Timedelta(days=DAILY_BUFFER_DAYS)).date()
             fresh = yahoo_chart.fetch_kline(
                 symbol, interval="1d", start=start, prepost=False
             )
         else:
-            # 分钟K：
-            #  - 非交易时段 → 跳过（run() 已整批跳过，此处双保险）
-            #  - 交易时段内但数据新鲜（最后时间点距今 < 运行间隔）→ 跳过，
-            #    避免每半小时重复拉取同一批分钟K
-            if not in_session:
-                return 0
-            minutes_since = (now_utc - last_ts).total_seconds() / 60
+            if not marketlib.is_market_session(region, now_local):
+                return 0, None
+            minutes_since = (now_utc - prev_ts).total_seconds() / 60
             if minutes_since < config.INCREMENTAL_MIN_INTERVAL_MINUTES:
-                return 0
-            # 增量：从最后时间点往回看缓冲段
-            start = last_ts - pd.Timedelta(days=config.INTRADAY_BUFFER_DAYS)
+                return 0, None
+            start = prev_ts - pd.Timedelta(days=config.INTRADAY_BUFFER_DAYS)
             fresh = yahoo_chart.fetch_kline(
                 symbol, interval=interval, start=start, prepost=True
             )
     else:
-        # 无已有数据：全量拉取该周期
+        # 无状态：全量拉取该周期（首次/自愈）
         fresh = yahoo_chart.fetch_kline(
             symbol,
             interval=interval,
@@ -159,8 +176,11 @@ def fetch_incremental(region: str, symbol: str, interval: str) -> int:
         )
 
     if fresh is None or fresh.empty:
-        return 0
-    return merge_and_upload(region, symbol, interval, fresh)
+        return 0, None
+    added, merged = merge_and_upload(region, symbol, interval, fresh)
+    if merged is None or merged.empty:
+        return added, None
+    return added, merged.index.max()
 
 
 def period_for(interval: str) -> str:
@@ -170,11 +190,20 @@ def period_for(interval: str) -> str:
     return config.INTRADAY_PERIOD[interval]
 
 
-def sync_minute_and_derived(region: str, symbol: str) -> int:
-    """拉取 1m + 1h 增量，并由 1m 增量重采样合并 5m/15m/30m。返回新增行数。"""
+def sync_minute_and_derived(
+    region: str, symbol: str, entry: dict
+) -> int:
+    """拉取 1m + 1h 增量，并由 1m 增量重采样合并 5m/15m/30m。
+
+    通过 entry（状态清单中该股票条目）记录各周期最后时间，返回新增行数。
+    """
     added = 0
     for interval in SOURCE_INTERVALS:
-        added += fetch_incremental(region, symbol, interval)
+        prev = _ts(entry.get(interval))
+        added_i, last_ts = fetch_incremental(region, symbol, interval, prev)
+        if last_ts is not None:
+            entry[interval] = _fmt(last_ts, interval)
+        added += added_i
     # 若无新增分钟数据，说明 1m 足够新鲜，派生K线也不会变，跳过重采样
     if added <= 0:
         return 0
@@ -204,19 +233,30 @@ def sync_minute_and_derived(region: str, symbol: str) -> int:
             if len(merged) > before:
                 r2store.put_csv(key_for(region, symbol, target), merged.to_csv())
                 added += len(merged) - before
+                entry[target] = _fmt(merged.index.max(), target)
     return added
 
 
-def _process_one(reg: str, symbol: str, do_minute: bool) -> tuple[str, int, str]:
-    """并发处理单只股票：返回 (symbol, added, err_msg)。err_msg 空表示成功。"""
+def _process_one(
+    reg: str, symbol: str, do_minute: bool, prev_entry: dict | None
+) -> tuple[str, int, str, dict]:
+    """并发处理单只股票。
+
+    返回 (symbol, added, err_msg, new_entry)。
+    err_msg 空表示成功；new_entry 为更新后的状态清单条目（失败时为不变）。
+    """
+    new_entry = dict(prev_entry) if prev_entry else {}
     try:
-        added_d = fetch_incremental(reg, symbol, "1d")
+        prev = _ts(new_entry.get("1d"))
+        added_d, last_ts = fetch_incremental(reg, symbol, "1d", prev)
+        if last_ts is not None:
+            new_entry["1d"] = _fmt(last_ts, "1d")
         added_m = 0
         if do_minute:
-            added_m = sync_minute_and_derived(reg, symbol)
-        return symbol, added_d + added_m, ""
+            added_m = sync_minute_and_derived(reg, symbol, new_entry)
+        return symbol, added_d + added_m, "", new_entry
     except Exception as exc:  # noqa: BLE001
-        return symbol, 0, str(exc)
+        return symbol, 0, str(exc), (dict(prev_entry) if prev_entry else {})
 
 
 def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
@@ -233,6 +273,7 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
             print(f"[跳过] {reg}: 当前不在交易时段（周末/休市），跳过分钟K", flush=True)
 
     total_added = 0
+    changed_symbols = 0
     failed: list[str] = []
 
     for reg in regions:
@@ -240,24 +281,36 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
         symbols = marketlib.slice_batch(symbols, batch, batches)
         if not symbols:
             continue
+        # 该 (region, batch) 独立的状态清单（各周期最后时间），替代逐个读 R2 判重
+        snap = state.read("kline", reg, batch)
         print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
 
         do_minute = reg in active_regions
         done = 0
+        reg_changed = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {pool.submit(_process_one, reg, sym, do_minute): sym for sym in symbols}
+            futures = {
+                pool.submit(_process_one, reg, sym, do_minute, snap.get(sym)): sym
+                for sym in symbols
+            }
             for fut in as_completed(futures):
-                sym, added, err = fut.result()
+                sym, added, err, new_entry = fut.result()
                 done += 1
                 if err:
                     failed.append(f"{reg}:{sym}")
-                elif added:
+                else:
                     total_added += added
+                    if new_entry and new_entry != snap.get(sym):
+                        snap[sym] = new_entry
+                        reg_changed += 1
                 if done % 25 == 0 or done == len(symbols):
                     print(
                         f"  [{done}/{len(symbols)}] {reg} 已处理，累计新增 {total_added} 行，失败 {len(failed)}",
                         flush=True,
                     )
+        # 仅当本轮有状态变化才写回清单，其余大部分股票不触碰 R2
+        if reg_changed > 0:
+            state.write("kline", reg, batch, snap)
 
     r2store.put_status(
         {
@@ -266,11 +319,12 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
             "regions": regions,
             "regions_minute": list(active_regions),
             "added": total_added,
+            "changed": changed_symbols,
             "failed": failed[:100],
             "fail_count": len(failed),
         }
     )
-    print(f"增量完成: 新增 {total_added} 行, 失败 {len(failed)} 项")
+    print(f"增量完成: 新增 {total_added} 行, 变更 {changed_symbols} 只, 失败 {len(failed)} 项")
     # 单只股票失败不视为整体失败（避免 job 失败导致其余批次被取消），
     # 失败明细已写入 _status.json 供后续重试。
     if failed:
