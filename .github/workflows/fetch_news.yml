@@ -2,8 +2,8 @@ name: Fetch News
 
 on:
   schedule:
-    # 每 1 小时刷新一次新闻（脚本内含重试，单只失败不中断）
-    - cron: "0 * * * *"
+    # 每 6 小时刷新一次新闻（Yahoo 新闻更新慢，6h 足够；区域级跳过+指纹门控会进一步减少写入）
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       region:

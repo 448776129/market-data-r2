@@ -119,6 +119,31 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
         snap = state.read("news", reg, batch)
         print(f"[区域] {reg} ({len(symbols)} 只, 批 {batch+1}/{batches}, 并发 {concurrency})", flush=True)
 
+        # ---- 提前检测：区域级新闻跳过 ----
+        # Yahoo 对部分区域（如 A 股）返回通用市场新闻，所有股票新闻 URL 集合相同。
+        # 采集前 2 只比较指纹：相同则为区域级新闻，首只未变即可跳过整批，
+        # 省掉 N-2 次 API 调用 + N 次 R2 写入。
+        skip_batch = False
+        if len(symbols) >= 2:
+            first_known = snap.get(symbols[0])
+            if first_known and first_known.get("h"):
+                try:
+                    d0 = yahoo_news.fetch_news(symbols[0])
+                    fp0 = _url_fingerprint(d0)
+                    d1 = yahoo_news.fetch_news(symbols[1])
+                    fp1 = _url_fingerprint(d1)
+                    if fp0 and fp0 == fp1 and fp0 == first_known["h"]:
+                        print(
+                            f"  [{reg}] 区域新闻未变（{symbols[0]}≡{symbols[1]}），跳过 {len(symbols)} 只",
+                            flush=True,
+                        )
+                        ok_count += len(symbols)
+                        skip_batch = True
+                except Exception:  # noqa: BLE001
+                    pass  # 检测失败则正常处理
+        if skip_batch:
+            continue
+
         done = 0
         reg_changed = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
