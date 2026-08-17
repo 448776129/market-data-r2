@@ -31,6 +31,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import config  # noqa: E402
+import kvstore  # noqa: E402
+import r2store  # noqa: E402
 
 
 def download(url: str) -> str:
@@ -76,8 +78,12 @@ def run(index: str | None) -> int:
             out = ROOT / config.DATA_DIR / config.UNIVERSE_SUBDIR / fname
             out.parent.mkdir(parents=True, exist_ok=True)
             rows = sorted(set(symbols))
-            out.write_text("\n".join(rows) + "\n", encoding="utf-8")
-            print(f"  共 {len(rows)} 只 -> {out.relative_to(ROOT)}", flush=True)
+            csv_text = "\n".join(rows) + "\n"
+            out.write_text(csv_text, encoding="utf-8")
+            # 上传到 R2 + KV（Worker 优先读 KV，毫秒级、不耗 R2 读额度）
+            r2store.put_universe(idx, csv_text)
+            kvstore.put_universe(idx, csv_text)
+            print(f"  共 {len(rows)} 只 -> {out.relative_to(ROOT)} (R2+KV)", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"  [失败] {idx}: {exc}", file=sys.stderr)
             failed = True

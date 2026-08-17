@@ -190,6 +190,23 @@ async function edgeCache(key, ttlSec, env, ctx, producer) {
   return resp;
 }
 
+// 读取静态清单（universe）：优先 KV（毫秒级、不耗 R2 读额度），miss 时 fallback R2。
+// name 对应 universe 文件名（不含 .csv 后缀），如 "csi300" / "us" / "hk"。
+// KV key: "universe:{name}"；R2 key: "universe/{name}.csv"。
+async function fetchUniverseText(name, env) {
+  // 1) 优先 KV
+  if (env && env.STATIC_KV) {
+    try {
+      const val = await env.STATIC_KV.get(`universe:${name}`, { type: "text" });
+      if (val !== null && val !== undefined) return val;
+    } catch (e) {
+      console.warn(`KV read failed for universe:${name}: ${e.message}`);
+    }
+  }
+  // 2) fallback R2 → GitHub raw
+  return await fetchUpstream(`data/universe/${name}.csv`, env);
+}
+
 // 读取数据：优先从 R2（MARKET_DATA_R2 binding）读取，失败时 fallback 到 GitHub raw。
 // path 形如 "data/{region}/kline/{symbol}.csv"，R2 中对象键为 "{region}/kline/{symbol}.csv"。
 // R2 中的 K 线 CSV 为 gzip 压缩存储（.gz 或 Content-Encoding: gzip），自动解压。
@@ -644,9 +661,9 @@ async function handleUniverse(params, env) {
     return error(`Invalid index: ${index}. Allowed: ${Object.keys(INDEX_LABEL).join(", ")}`);
   }
 
-  const text = await fetchUpstream(`data/universe/${index}.csv`, env);
+  const text = await fetchUniverseText(index, env);
   if (text === null) {
-    return error(`No universe file: data/universe/${index}.csv`, 404);
+    return error(`No universe file: universe/${index}.csv`, 404);
   }
 
   // universe 文件为每行一个股票代码（无表头）
@@ -671,7 +688,7 @@ async function handleIndices(env) {
   const items = [];
   for (const name of names) {
     try {
-      const text = await fetchUpstream(`data/universe/${name}.csv`, env);
+      const text = await fetchUniverseText(name, env);
       const count = text === null ? 0 : text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("#")).length;
       items.push({ index: name, name: INDEX_LABEL[name], count });
     } catch {
@@ -692,9 +709,9 @@ async function handleSymbols(params, env) {
   const limit = Math.min(parseInt(params.get("limit") || "100", 10), 1000);
   const offset = Math.max(parseInt(params.get("offset") || "0", 10), 0);
 
-  const text = await fetchUpstream(`data/universe/${region}.csv`, env);
+  const text = await fetchUniverseText(region, env);
   if (text === null) {
-    return error(`No universe file: data/universe/${region}.csv`, 404);
+    return error(`No universe file: universe/${region}.csv`, 404);
   }
 
   const symbols = text

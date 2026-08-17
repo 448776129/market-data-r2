@@ -25,5 +25,15 @@ bucket_name = "stocksmarkets"
 #   如需对自定义域开启更强 CDN 层缓存，可在面板 Cache Rules 中添加：
 #     stockapi.365200.xyz/*kline* 等 按 head，浏览器缓存 0 分钟，边缘缓存 1 分钟
 
+# KV 存储绑定：静态清单（universe/indices）迁至 KV
+# KV 读取毫秒级、不计 Worker CPU、不消耗 R2 读额度。
+# 采集端写 R2 的同时双写 KV；Worker 优先读 KV，miss 时 fallback 到 R2。
+# 面板创建 KV namespace 后，将下方 id 替换为实际值（或用 wrangler kv namespace create 创建）。
+# 创建命令：cd api && wrangler kv namespace create STATIC_KV
+# 然后将返回的 id 填入下方 id 字段。
+[[kv_namespaces]]
+binding = "STATIC_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
 [observability]
 enabled = true

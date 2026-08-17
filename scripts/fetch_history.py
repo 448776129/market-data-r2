@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import config  # noqa: E402
+import kvstore  # noqa: E402
 import marketlib  # noqa: E402
 import r2store  # noqa: E402
 import yahoo_chart  # noqa: E402
@@ -167,7 +168,9 @@ def run(region: str | None, batch: int = 0, batches: int = 1) -> int:
         # 区域清单一并上传（供 Worker /universe 读取）——始终用完整清单，避免 batch 覆盖
         csv_text = "\n".join(all_symbols) + "\n"
         r2store.put_universe(reg, csv_text)
-        print(f"[区域] {reg} 完整清单已上传 universe/{reg}.csv", flush=True)
+        # 双写 KV：Worker 优先读 KV（毫秒级、不耗 R2 读额度）
+        kvstore.put_universe(reg, csv_text)
+        print(f"[区域] {reg} 完整清单已上传 universe/{reg}.csv (R2+KV)", flush=True)
 
     # 全局状态
     r2store.put_status(
