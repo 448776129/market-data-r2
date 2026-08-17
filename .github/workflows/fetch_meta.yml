@@ -3,12 +3,12 @@ name: Fetch Meta (Media Info)
 # 媒体/行情快照信息采集（独立于增量同步）。
 # 运行 scripts/fetch_meta.py：采集各股票的名称/币种/交易所/52周高低/实时价快照，
 # 存为 {region}/meta/{symbol}.json → R2，供 API 的 /quote 和 /price 使用。
-# 每 1 小时定时刷新，也可手动触发单区域。
+# 每 12 小时定时刷新，也可手动触发单区域。
 
 on:
   schedule:
-    # 每 1 小时刷新一次基本面快照（脚本内含重试，单只失败不中断）
-    - cron: "0 * * * *"
+    # 每 12 小时刷新一次基本面快照（UTC 00:00 / 12:00 = 北京时间 08:00 / 20:00）
+    - cron: "0 */12 * * *"
   workflow_dispatch:
     inputs:
       region:
